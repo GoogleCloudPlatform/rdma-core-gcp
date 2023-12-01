@@ -2363,8 +2363,7 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 			info.op.atomic_compare_swap.tagged_offset = ib_wr->sg_list[0].addr;
 			info.op.atomic_compare_swap.remote_tagged_offset =
 							ib_wr->wr.atomic.remote_addr;
-			info.op.atomic_compare_swap.swap_data_bytes =
-							ib_wr->wr.atomic.swap;
+			info.op.atomic_compare_swap.swap_data_bytes = ib_wr->wr.atomic.swap;
 			info.op.atomic_compare_swap.compare_data_bytes =
 							ib_wr->wr.atomic.compare_add;
 			info.op.atomic_compare_swap.stag = ib_wr->sg_list[0].lkey;
@@ -2511,8 +2510,9 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 				(ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_REMOTE_READ) ? 1 : 0;
 			info.op.bind_window.ena_writes =
 				(ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_REMOTE_WRITE) ? 1 : 0;
-			info.op.bind_window.remote_atomics_en =
-				(ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_REMOTE_ATOMIC) ? 1 : 0;
+			if (uk_attrs->feature_flags & IRDMA_FEATURE_ATOMIC_OPS)
+				info.op.bind_window.remote_atomics_en =
+					(ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_REMOTE_ATOMIC) ? 1 : 0;
 
 			err = irdma_uk_mw_bind(&iwuqp->qp, &info, false);
 			break;
