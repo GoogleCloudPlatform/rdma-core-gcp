@@ -33,6 +33,7 @@ enum irdma_supported_wc_flags_ex {
 				    | IBV_WC_EX_WITH_IMM
 				    | IBV_WC_EX_WITH_QP_NUM
 				    | IBV_WC_EX_WITH_SRC_QP
+				    | IBV_WC_EX_WITH_SLID
 				    | IBV_WC_EX_WITH_SL,
 	IRDMA_GEN3_WC_FLAGS_EX = IRDMA_STANDARD_WC_FLAGS_EX |
 				 IBV_WC_EX_WITH_COMPLETION_TIMESTAMP,
