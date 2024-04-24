@@ -2499,12 +2499,14 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 				ib_wr->bind_mw.mw->rkey = info.op.bind_window.mw_stag;
 			}
 
-			if (ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_ZERO_BASED)
+			if (ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_ZERO_BASED) {
 				info.op.bind_window.addressing_type = IRDMA_ADDR_TYPE_ZERO_BASED;
-			else
+				info.op.bind_window.va =  NULL;
+			} else {
 				info.op.bind_window.addressing_type = IRDMA_ADDR_TYPE_VA_BASED;
-
-			info.op.bind_window.va =  (void *)(uintptr_t)ib_wr->bind_mw.bind_info.addr;
+				info.op.bind_window.va =
+						(void *)(uintptr_t)ib_wr->bind_mw.bind_info.addr;
+			}
 			info.op.bind_window.bind_len = ib_wr->bind_mw.bind_info.length;
 			info.op.bind_window.ena_reads =
 				(ib_wr->bind_mw.bind_info.mw_access_flags & IBV_ACCESS_REMOTE_READ) ? 1 : 0;
