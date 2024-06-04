@@ -777,7 +777,7 @@ static inline int get_cq_size(int ncqe, __u8 hw_rev, bool cqe_64byte_ena)
 		ncqe += 1; /* cq size must be an even number */
 
 	if (ncqe * cqe_size == IRDMA_HW_PAGE_SIZE)
-		ncqe += 2;
+		ncqe += 2;	
 
 	if (ncqe < IRDMA_U_MINCQ_SIZE)
 		ncqe = IRDMA_U_MINCQ_SIZE;
@@ -2824,8 +2824,8 @@ int irdma_uresize_cq(struct ibv_cq *cq, int cqe)
 	if (cqe < uk_attrs->min_hw_cq_size || cqe > uk_attrs->max_hw_cq_size - 1)
 		return EINVAL;
 
-	cqe_64byte_ena = uk_attrs->feature_flags & IRDMA_FEATURE_64_BYTE_CQE ? true : false;
-
+	cqe_64byte_ena = uk_attrs->feature_flags & IRDMA_FEATURE_64_BYTE_CQE ?
+				true : false;
 	cqe_needed = get_cq_size(cqe, uk_attrs->hw_rev, cqe_64byte_ena);
 	if (cqe_needed == iwucq->cq.cq_size)
 		return 0;
