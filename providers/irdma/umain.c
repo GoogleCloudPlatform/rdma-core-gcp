@@ -22,6 +22,10 @@
 #include "umain.h"
 #include "abi.h"
 
+struct irdma_env_params env = {
+	.pass_cie_vendor_err = false,
+};
+
 unsigned int irdma_dbg;
 static pthread_t dbg_thread;
 static pthread_cond_t cond_sigusr1_rcvd;
@@ -355,10 +359,22 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 {
 	struct irdma_udevice *dev;
 	char *env_val;
+	int tmp;
 
 	dev = calloc(1, sizeof(*dev));
 	if (!dev)
 		return NULL;
+
+	env_val = getenv("IRDMA_PASS_CIE_VENDOR_ERR");
+	if (env_val) {
+		tmp = atoi(env_val);
+		if (tmp == 0 || tmp == 1)
+			env.pass_cie_vendor_err = tmp;
+		else
+			fprintf(stderr,
+				"%s: Invalid value (%d) for "
+				"IRDMA_PASS_CIE_VENDOR_ERR\n", __func__, tmp);
+	}
 
 	env_val = getenv("IRDMA_DEBUG");
 	if (env_val)
