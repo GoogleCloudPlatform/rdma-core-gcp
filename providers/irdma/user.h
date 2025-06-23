@@ -5,6 +5,17 @@
 
 #include "osdep.h"
 
+struct irdma_env_params {
+	/* For CIEs which would normally be masked (i.e., UD TX drops), this
+	 * flag will allow the vendor error to be passed through to the ibv_wc.
+	 * This may be useful for applications that wish to directly react to
+	 * explicit TX drop notifications.
+	 */
+	bool pass_cie_vendor_err;
+};
+
+extern struct irdma_env_params env;
+
 #define irdma_handle void *
 #define irdma_adapter_handle irdma_handle
 #define irdma_qp_handle irdma_handle
