@@ -1216,6 +1216,8 @@ static void irdma_process_cqe(struct ibv_wc *entry, struct irdma_cq_poll_info *c
 		entry->status = IBV_WC_SUCCESS;
 	}
 
+	entry->vendor_err = cur_cqe->major_err << 16 | cur_cqe->minor_err;
+
 	if (cur_cqe->imm_valid) {
 		entry->imm_data = htonl(cur_cqe->imm_data);
 		entry->wc_flags |= IBV_WC_WITH_IMM;
@@ -1508,7 +1510,7 @@ static uint32_t irdma_wc_read_vendor_err(struct ibv_cq_ex *ibvcq_ex)
 	iwucq = container_of(ibvcq_ex, struct irdma_ucq, verbs_cq.cq_ex);
 	cur_cqe = &iwucq->cur_cqe;
 
-	return cur_cqe->error ? cur_cqe->major_err << 16 | cur_cqe->minor_err : 0;
+	return cur_cqe->major_err << 16 | cur_cqe->minor_err;
 }
 
 static unsigned int irdma_wc_read_wc_flags(struct ibv_cq_ex *ibvcq_ex)
