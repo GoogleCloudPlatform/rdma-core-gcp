@@ -26,6 +26,7 @@ struct irdma_env_params env = {
 	.pass_cie_vendor_err = false,
 	.ud_qd_override = 0,
 	.transparent_ud_qd_override = 0,
+	.cq_size_override = 0,
 };
 
 unsigned int irdma_dbg;
@@ -400,6 +401,16 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 			env.transparent_ud_qd_override = tmp;
 	}
 
+	env_val = getenv("IRDMA_CQ_SIZE_OVERRIDE");
+	if (env_val) {
+		tmp = atoi(env_val);
+		if (tmp < 0)
+			fprintf(stderr, "Ignoring invalid "
+				"IRDMA_CQ_SIZE_OVERRIDE value of %d\n", tmp);
+		else
+			env.cq_size_override = tmp;
+	}
+
 	env_val = getenv("IRDMA_DEBUG");
 	if (env_val)
 		irdma_dbg = atoi(env_val);
@@ -409,9 +420,10 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 		       "Params:\n"
 		       "\tIRDMA_PASS_CIE_VENDOR_ERR = %d\n"
 		       "\tIRDMA_UD_QD_OVERRIDE = %d\n"
-		       "\tIRDMA_TRANSPARENT_UD_QD_OVERRIDE = %d\n",
+		       "\tIRDMA_TRANSPARENT_UD_QD_OVERRIDE = %d\n"
+		       "\tIRDMA_CQ_SIZE_OVERRIDE = %d\n",
 		       env.pass_cie_vendor_err, env.ud_qd_override,
-		       env.transparent_ud_qd_override);
+		       env.transparent_ud_qd_override, env.cq_size_override);
 	}
 
 	/* Create debug_thread only once upon first call to irdma_device_alloc
