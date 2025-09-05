@@ -39,6 +39,11 @@ struct irdma_env_params {
 	 *    only the first 2 will be sent until completions are polled.
 	 */
 	uint32_t transparent_ud_qd_override;
+
+	/* If non-zero, the user's requested CQ size will be ignored and the
+	 * value specified will be used instead.
+	 */
+	uint32_t cq_size_override;
 };
 
 extern struct irdma_env_params env;
