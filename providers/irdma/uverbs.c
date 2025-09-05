@@ -835,6 +835,9 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 		}
 	}
 
+	if (env.cq_size_override)
+		attr_ex->cqe = env.cq_size_override;
+
 	if (attr_ex->cqe < uk_attrs->min_hw_cq_size || attr_ex->cqe > uk_attrs->max_hw_cq_size - 1) {
 		errno = EINVAL;
 		return NULL;
