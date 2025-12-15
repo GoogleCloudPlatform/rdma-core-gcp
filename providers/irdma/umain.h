@@ -300,4 +300,7 @@ struct ibv_td *irdma_ualloc_td(struct ibv_context *context,
 int irdma_udealloc_td(struct ibv_td *td);
 struct ibv_pd *irdma_ualloc_parent_domain(struct ibv_context *context,
 					  struct ibv_parent_domain_init_attr *int_attr);
+int try_acquire_credit(uint32_t *cookie);
+void release_credit(int index, uint32_t cookie);
+
 #endif /* IRDMA_UMAIN_H */

@@ -281,6 +281,13 @@ __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
 	 */
 	qp->sq_wrtrk_array[*wqe_idx].signaled_override =
 		info->signaled_override;
+	/* Credit pool support. */
+	qp->sq_wrtrk_array[*wqe_idx].shared_credit =
+		info->shared_credit;
+	qp->sq_wrtrk_array[*wqe_idx].credit_cookie =
+		info->credit_cookie;
+	qp->sq_wrtrk_array[*wqe_idx].credit_index =
+		info->credit_index;
 	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
 		atomic_fetch_add(&qp->sq_ring.post_cnt, 1);
 		if (info->signaled) {
@@ -1576,6 +1583,13 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	} else { /* q_type is IRDMA_CQE_QTYPE_SQ */
 		info->signaled_override =
 			qp->sq_wrtrk_array[wqe_idx].signaled_override;
+		/* Credit pool support. */
+		info->shared_credit =
+			qp->sq_wrtrk_array[wqe_idx].shared_credit;
+		info->credit_cookie =
+			qp->sq_wrtrk_array[wqe_idx].credit_cookie;
+		info->credit_index =
+			qp->sq_wrtrk_array[wqe_idx].credit_index;
 		if (qp->first_sq_wq) {
 			if (wqe_idx + 1 >= qp->conn_wqes)
 				qp->first_sq_wq = false;
