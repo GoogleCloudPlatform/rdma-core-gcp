@@ -44,6 +44,9 @@ struct irdma_env_params {
 	 * value specified will be used instead.
 	 */
 	uint32_t cq_size_override;
+
+	/* Number of shared UD credits. Max of 1024. */
+	uint32_t shared_ud_credits;
 };
 
 extern struct irdma_env_params env;
@@ -413,6 +416,7 @@ struct irdma_post_sq_info {
 	__u8 l4len;
 	bool signaled:1;
 	bool signaled_override:1;
+	bool shared_credit:1;
 	bool read_fence:1;
 	bool local_fence:1;
 	bool inline_data:1;
@@ -422,6 +426,8 @@ struct irdma_post_sq_info {
 	bool udp_hdr:1;
 	bool defer_flag:1;
 	bool remote_atomic_en:1;
+	uint32_t credit_cookie;
+	int credit_index;
 	__u32 imm_data;
 	__u32 stag_to_inv;
 	union {
@@ -461,6 +467,9 @@ struct irdma_cq_poll_info {
 	bool ud_smac_valid:1;
 	bool imm_valid:1;
 	bool signaled_override:1;
+	bool shared_credit:1;
+	uint32_t credit_cookie;
+	int credit_index;
 	union {
 		__u32 tcp_sqn;
 		__u32 roce_psn;
@@ -566,9 +575,12 @@ struct irdma_sig_wr_trk_info {
 struct irdma_sq_uk_wr_trk_info {
 	__u64 wrid;
 	__u32 wr_len;
+	__u32 credit_cookie;
+	int credit_index;
 	__u16 quanta;
-	__u8 signaled;
-	__u8 signaled_override;
+	bool signaled:1;
+	bool signaled_override:1;
+	bool shared_credit:1;
 };
 
 struct irdma_qp_quanta {
