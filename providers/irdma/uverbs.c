@@ -1256,7 +1256,9 @@ static void irdma_process_cqe(struct ibv_wc *entry, struct irdma_cq_poll_info *c
 }
 
 static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
-			      struct ibv_send_wr **bad_wr);
+			      struct ibv_send_wr **bad_wr, bool shared_credit,
+			      uint32_t credit_cookie, int credit_index);
+static void irdma_try_drain_sq_backlog(struct irdma_uqp *qp);
 
 /**
  * irdma_handle_deferred_ud - Check for and handle the UD deferred SQ.
@@ -1279,7 +1281,7 @@ static void irdma_handle_deferred_ud(struct irdma_uqp *qp)
 	wr->sg_list = qp->ud_ring.entry[masked_cons].sgl;
 	qp->ud_ring.cons++;
 
-	__irdma_upost_send(&qp->ibv_qp, wr, &bad_wr);
+	__irdma_upost_send(&qp->ibv_qp, wr, &bad_wr, false, 0, 0);
 }
 
 /**
@@ -1309,9 +1311,15 @@ static int irdma_poll_one(struct irdma_cq_uk *ukcq, struct irdma_cq_poll_info *c
 		    cur_cqe->q_type == IRDMA_CQE_QTYPE_SQ) {
 			irdma_spin_lock(&iwuqp->lock);
 			if (!iwuqp->ud_ring.delete_in_progress) {
-				iwuqp->ud_ring.active--;
-				irdma_handle_deferred_ud(iwuqp);
+				if (cur_cqe->shared_credit) {
+					release_credit(cur_cqe->credit_index,
+						       cur_cqe->credit_cookie);
+				} else {
+					iwuqp->ud_ring.active--;
+					irdma_handle_deferred_ud(iwuqp);
+				}
 			}
+			irdma_try_drain_sq_backlog(iwuqp);
 			irdma_spin_unlock(&iwuqp->lock);
 		}
 
@@ -2305,11 +2313,15 @@ static void irdma_enqueue_deferred_ud(struct irdma_uqp *iwuqp,
  * @ib_qp: qp to post wr
  * @ib_wr: work request ptr
  * @bad_wr: return of bad wr if err
+ * @shared_credit: Flag to indicate whether a shared credit was used. UD only.
+ * @credit_cookie: Shared credit cookie. Only used if shared_credit==true.
+ * @credit_index: Shared credit index. Only used if shared_credit==true.
  *
  * Context: Assumes QP lock is held.
  */
 static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
-			      struct ibv_send_wr **bad_wr)
+			      struct ibv_send_wr **bad_wr, bool shared_credit,
+			      uint32_t credit_cookie, int credit_index)
 {
 	struct irdma_post_sq_info info;
 	struct irdma_uvcontext *iwvctx;
@@ -2329,7 +2341,7 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 
 	while (ib_wr) {
 		if (env.transparent_ud_qd_override &&
-		    ib_qp->qp_type == IBV_QPT_UD) {
+		    ib_qp->qp_type == IBV_QPT_UD && !shared_credit) {
 			if (iwuqp->ud_ring.active >=
 			    env.transparent_ud_qd_override) {
 				/* HW limit is reached, queue it for later. */
@@ -2415,7 +2427,11 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 				info.op.send.dest_qp = ib_wr->wr.ud.remote_qpn;
 
 				if (env.transparent_ud_qd_override) {
-					iwuqp->ud_ring.active++;
+					info.shared_credit = shared_credit;
+					info.credit_cookie = credit_cookie;
+					info.credit_index = credit_index;
+					if (!shared_credit)
+						iwuqp->ud_ring.active++;
 					if (!info.signaled) {
 						info.signaled = true;
 						info.signaled_override = true;
@@ -2527,12 +2543,49 @@ static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 	if (err)
 		*bad_wr = ib_wr;
 
-	if (!iwuqp->qp.push_db)
+	if (!iwuqp->qp.push_db && !shared_credit)
 		irdma_uk_qp_post_wr(&iwuqp->qp);
 	if (reflush)
 		irdma_issue_flush(ib_qp, 1, 0);
 
 	return err;
+}
+
+/**
+ * irdma_try_drain_sq_backlog - Try to drain the backlog using shared credits.
+ * @qp: qp
+ *
+ * Context: QP lock must be held.
+ */
+static void irdma_try_drain_sq_backlog(struct irdma_uqp *qp)
+{
+	struct ibv_send_wr *bad_wr;
+	struct ibv_send_wr *wr;
+	bool posted = false;
+	uint32_t cookie;
+	uint32_t cons;
+	int ret;
+
+	while (true) {
+		if (qp->ud_ring.cons == qp->ud_ring.prod)
+			break;
+
+		ret = try_acquire_credit(&cookie);
+		if (ret < 0)
+			break;
+
+		cons = qp->ud_ring.cons & (qp->ud_ring.ring_size - 1u);
+		wr = &qp->ud_ring.entry[cons].wqe;
+		wr->sg_list = qp->ud_ring.entry[cons].sgl;
+
+		qp->ud_ring.cons++;
+
+		__irdma_upost_send(&qp->ibv_qp, wr, &bad_wr, true, cookie, ret);
+		posted = true;
+	}
+
+	if (posted)
+		irdma_uk_qp_post_wr(&qp->qp);
 }
 
 /**
@@ -2553,7 +2606,10 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 	if (err)
 		return err;
 
-	err = __irdma_upost_send(ib_qp, ib_wr, bad_wr);
+	err = __irdma_upost_send(ib_qp, ib_wr, bad_wr, false, 0, 0);
+
+	if (env.transparent_ud_qd_override && ib_qp->qp_type == IBV_QPT_UD)
+		irdma_try_drain_sq_backlog(iwuqp);
 
 	irdma_spin_unlock(&iwuqp->lock);
 
