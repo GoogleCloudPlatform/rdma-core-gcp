@@ -6,3 +6,5 @@ rdma_provider(irdma
   umain.c
   uverbs.c
 )
+
+target_link_libraries("irdma-rdmav${IBVERBS_PABI_VERSION}" PRIVATE rt)

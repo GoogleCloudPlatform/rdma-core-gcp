@@ -22,11 +22,40 @@
 #include "umain.h"
 #include "abi.h"
 
+/* Shm ABI max. */
+#define SHARED_UD_MAX_CREDITS            1024u
+
+/* If a credit is held for >= 8 seconds, assume owner dead and reclaim it. */
+#define SHARED_UD_CREDIT_RECLAIM_S       8u
+
+#define SHARED_UD_SHM_NAME               "/irdma_ud_shm"
+#define SHARED_UD_SHM_SIZE               sizeof(struct shared_ud_shm)
+#define SHARED_UD_SHM_ABI_VER            1
+
+struct shared_ud_shm {
+	/* Shm region is initialized to 0 by default. This gets set to true by
+	 * the process that wins the race to create the region.
+	 */
+	_Atomic(bool) init_done;
+	uint32_t abi_version;
+	/* Credit array. */
+	_Atomic(uint32_t) acquire_time[SHARED_UD_MAX_CREDITS];
+};
+
+/* Mutual exclusion during init isn't strictly necessary... there can already be
+ * multiple independent processes racing for init and the init routine is robust
+ * in that scenario...
+ */
+static pthread_mutex_t shared_ud_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(bool) shared_ud_init_done;
+static struct shared_ud_shm *g_shared_ud_shm;
+
 struct irdma_env_params env = {
 	.pass_cie_vendor_err = false,
 	.ud_qd_override = 0,
 	.transparent_ud_qd_override = 0,
 	.cq_size_override = 0,
+	.shared_ud_credits = 0,
 };
 
 unsigned int irdma_dbg;
@@ -166,6 +195,151 @@ static void i40iw_set_hw_attrs(struct irdma_uk_attrs *attrs)
 	attrs->max_hw_cq_size = I40IW_MAX_CQ_SIZE;
 	attrs->min_hw_cq_size = IRDMA_MIN_CQ_SIZE;
 	attrs->min_hw_wq_size = I40IW_MIN_WQ_SIZE;
+}
+
+static uint32_t seconds(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
+/* Try to obtain a UD credit. May fail if racing with another thread. Returns
+ * true on success.
+ */
+static bool try_ud_credit(_Atomic(uint32_t) *credit_ts, uint32_t *old_credit_ts,
+			  uint32_t now)
+{
+	return atomic_compare_exchange_weak_explicit(credit_ts,
+						     old_credit_ts,
+						     now,
+						     memory_order_relaxed,
+						     memory_order_relaxed);
+}
+
+/* Returns -1 on failure, or the credit index otherwise. */
+int try_acquire_credit(uint32_t *cookie)
+{
+	struct shared_ud_shm *inst = g_shared_ud_shm;
+	uint32_t acquisition_ts;
+	uint32_t delta;
+	uint32_t now;
+	size_t i;
+
+	if (!atomic_load_explicit(&shared_ud_init_done, memory_order_acquire))
+		return -1;
+
+	now = seconds();
+
+	for (i = 0; i < env.shared_ud_credits; i++) {
+		acquisition_ts =
+			atomic_load_explicit(&inst->acquire_time[i],
+					     memory_order_relaxed);
+		delta = now - acquisition_ts;
+		if (!acquisition_ts || delta > SHARED_UD_CREDIT_RECLAIM_S) {
+			if (try_ud_credit(&inst->acquire_time[i],
+					  &acquisition_ts, now)) {
+				*cookie = now;
+				return i;
+			}
+		}
+	}
+
+	return -1;
+}
+
+/* Return a credit to the table. */
+void release_credit(int index, uint32_t cookie)
+{
+	struct shared_ud_shm *inst = g_shared_ud_shm;
+
+	/* No need to check init because returning a credit implies it. */
+	atomic_compare_exchange_strong_explicit(&inst->acquire_time[index],
+						&cookie, 0,
+						memory_order_relaxed,
+						memory_order_relaxed);
+}
+
+/* Initialize the backpressure shared memory region for the first time. */
+static void init_backpressure_region(struct shared_ud_shm *inst)
+{
+	size_t i;
+
+	for (i = 0; i < SHARED_UD_MAX_CREDITS; i++)
+		atomic_store(&inst->acquire_time[i], 0);
+
+	inst->abi_version = SHARED_UD_SHM_ABI_VER;
+
+	atomic_store(&inst->init_done, true);
+}
+
+static void init_ud_credits(void)
+{
+	int shm_fd;
+	bool created = false;
+	struct shared_ud_shm *inst;
+
+	if (atomic_load_explicit(&shared_ud_init_done, memory_order_relaxed))
+		return;
+
+	shm_fd = shm_open(SHARED_UD_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
+	if (shm_fd >= 0) {
+		/* We won the race to create the region. */
+		created = true;
+	} else if (errno == EEXIST) {
+		/* We lost the race. */
+		shm_fd = shm_open(SHARED_UD_SHM_NAME, O_RDWR, 0);
+		if (shm_fd == -1) {
+			perror("Failed to open existing backpressure region");
+			return;
+		}
+	} else {
+		perror("Failed to open backpressure region");
+		return;
+	}
+
+	/* ftruncate is supposed to be atomic... */
+	if (ftruncate(shm_fd, SHARED_UD_SHM_SIZE) == -1) {
+		perror("Failed to set backpressure region size");
+		close(shm_fd);
+		if (created)
+			shm_unlink(SHARED_UD_SHM_NAME);
+		return;
+	}
+
+	inst = mmap(NULL, SHARED_UD_SHM_SIZE, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, shm_fd, 0);
+	if (inst == MAP_FAILED) {
+		perror("Failed to map backpressure region");
+		close(shm_fd);
+		if (created)
+			shm_unlink(SHARED_UD_SHM_NAME);
+		exit(EXIT_FAILURE);
+	}
+
+	if (created) {
+		printf("Created shared UD credit table\n");
+		init_backpressure_region(inst);
+	} else {
+		while (!atomic_load(&inst->init_done))
+			/* Wait for the creator to finish initializing. */
+			usleep(1000);
+		if (inst->abi_version != SHARED_UD_SHM_ABI_VER) {
+			fprintf(stderr, "Backpressure region ABI mismatch!\n"
+					"This is expected if an update was "
+					"performed without rebooting.\n"
+					"Cleaning up then exiting. "
+					"Please restart the application.\n");
+			/* Delete the region. */
+			shm_unlink(SHARED_UD_SHM_NAME);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	close(shm_fd);
+
+	g_shared_ud_shm = inst;
+	atomic_store_explicit(&shared_ud_init_done, true, memory_order_release);
 }
 
 /**
@@ -411,6 +585,20 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 			env.cq_size_override = tmp;
 	}
 
+	env_val = getenv("IRDMA_SHARED_UD_CREDITS");
+	if (env_val) {
+		tmp = atoi(env_val);
+		if (tmp < 0) {
+			fprintf(stderr, "Ignoring invalid "
+				"IRDMA_SHARED_UD_CREDITS value of %d\n", tmp);
+		} else if (tmp > SHARED_UD_MAX_CREDITS) {
+			fprintf(stderr, "Clamping IRDMA_SHARED_UD_CREDITS to "
+				"%d\n", SHARED_UD_MAX_CREDITS);
+			tmp = SHARED_UD_MAX_CREDITS;
+		}
+		env.shared_ud_credits = tmp;
+	}
+
 	env_val = getenv("IRDMA_DEBUG");
 	if (env_val)
 		irdma_dbg = atoi(env_val);
@@ -421,9 +609,11 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 		       "\tIRDMA_PASS_CIE_VENDOR_ERR = %d\n"
 		       "\tIRDMA_UD_QD_OVERRIDE = %d\n"
 		       "\tIRDMA_TRANSPARENT_UD_QD_OVERRIDE = %d\n"
-		       "\tIRDMA_CQ_SIZE_OVERRIDE = %d\n",
+		       "\tIRDMA_CQ_SIZE_OVERRIDE = %d\n"
+		       "\tIRDMA_SHARED_UD_CREDITS = %d\n",
 		       env.pass_cie_vendor_err, env.ud_qd_override,
-		       env.transparent_ud_qd_override, env.cq_size_override);
+		       env.transparent_ud_qd_override, env.cq_size_override,
+		       env.shared_ud_credits);
 	}
 
 	/* Create debug_thread only once upon first call to irdma_device_alloc
@@ -442,6 +632,11 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 			return NULL;
 		}
 	}
+
+	pthread_mutex_lock(&shared_ud_init_lock);
+	if (env.transparent_ud_qd_override && env.shared_ud_credits)
+		init_ud_credits();
+	pthread_mutex_unlock(&shared_ud_init_lock);
 
 	return &dev->ibv_dev;
 }
