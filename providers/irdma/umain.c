@@ -55,7 +55,7 @@ struct irdma_env_params env = {
 	.ud_qd_override = 0,
 	.transparent_ud_qd_override = 0,
 	.cq_size_override = 0,
-	.shared_ud_credits = 0,
+	.shared_ud_credits = 64,
 };
 
 unsigned int irdma_dbg;
@@ -252,12 +252,9 @@ int try_acquire_credit(uint32_t *cookie)
 void release_credit(int index, uint32_t cookie)
 {
 	struct shared_ud_shm *inst = g_shared_ud_shm;
+	atomic_store_explicit(&inst->acquire_time[index], 0,
+			      memory_order_relaxed);
 
-	/* No need to check init because returning a credit implies it. */
-	atomic_compare_exchange_strong_explicit(&inst->acquire_time[index],
-						&cookie, 0,
-						memory_order_relaxed,
-						memory_order_relaxed);
 }
 
 /* Initialize the backpressure shared memory region for the first time. */
