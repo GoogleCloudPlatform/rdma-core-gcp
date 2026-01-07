@@ -64,6 +64,7 @@ struct irdma_alloc_ucontext_resp {
 	__u16 min_hw_wq_size;
 	__u32 max_hw_srq_quanta;
 	__u16 max_hw_push_len;
+	__u8 rsvd3[2];
 };
 
 struct irdma_alloc_pd_resp {
