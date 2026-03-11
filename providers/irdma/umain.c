@@ -282,6 +282,9 @@ static void init_ud_credits(void)
 	shm_fd = shm_open(SHARED_UD_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
 	if (shm_fd >= 0) {
 		/* We won the race to create the region. */
+		/* Force 0666 permissions to override any restrictive umask */
+		if (fchmod(shm_fd, 0666) == -1)
+			perror("Failed to force 0666 permissions on shm");
 		created = true;
 	} else if (errno == EEXIST) {
 		/* We lost the race. */
