@@ -1,3 +1,31 @@
+# About this repo
+
+## What is this repo?
+
+This is a clone of the [upstream RDMA Core Userspace Libraries and Daemons](https://github.com/linux-rdma/rdma-core) with out-of-tree patches staged additionally in order for RDMA to work on Google Cloud Platform.
+
+**This is not the final destination of GCP-specific RDMA core patches and GCP does not intend to indefinitely maintain out-of-tree changes.** GCP aims to upstream changes made in RDMA core, and this repo serves to stage those out-of-tree changes before they are fully ingested into the mainline. 
+
+Eventually, we anticipate this repo to be essentially a mirror of the upstream if all major patches are accepted, with future developments happening in between.
+
+## What does each branch do?
+
+* The `master` branch is a pristine mirror of the upstream main branch for reference purposes, we expect to update it periodically.
+
+* The `out-of-tree` branch continuously tracks the master branch, plus **OOT patches** applied, it can be a few versions behind upstream mainly for compatibility reasons.
+
+* The `oot-v<XX>` branches are versioned releases, we will try to maintain stability and backport fixes/updates on a best-effort basis.
+
+Other branches from the upstream (namely, stable branches) are omitted here for simplicity of reference and maintenance, they can be found in the [upstream RDMA core repo](https://github.com/linux-rdma/rdma-core).
+
+## Pull requests and collaborations
+
+This repo is mainly for staging and open-source purposes and doesn't expect community contributions, please directly contribute to the upstream repo instead.
+
+---
+
+> The original README begins here
+
 [![Build Status](https://dev.azure.com/ucfconsort/rdma-core/_apis/build/status/linux-rdma.rdma-core?branchName=master)](https://dev.azure.com/ucfconsort/rdma-core/_build/latest?definitionId=2&branchName=master)
 
 # RDMA Core Userspace Libraries and Daemons
