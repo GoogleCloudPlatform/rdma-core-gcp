@@ -12,6 +12,33 @@ struct irdma_env_params {
 	 * explicit TX drop notifications.
 	 */
 	bool pass_cie_vendor_err;
+
+	/* If non-zero, then the returned SQ depth attribute during QP creation
+	 * is clamped to the specified value. The underlying ring size is not
+	 * changed. This is effective in limiting outstanding UD operations for
+	 * applications that respect the returned SQ depth value even if it is
+	 * lower than requested.
+	 */
+	uint32_t ud_qd_override;
+
+	/* If non-zero, then the queue depth for each UD QP is transparently
+	 * limited to the specified value. This is achieved by submitting new
+	 * requests to an overflow queue when the limit of outstanding requests
+	 * is reached, and draining the overflow queue as completions are
+	 * polled. There are two implications here:
+	 *
+	 * 1. All UD sends are forced to be signaled (but dropped during CQ poll
+	 *    so that the user doesn't receive them). This means that there is
+	 *    a small potential for an unexpected CQ overflow if an application
+	 *    tracks CQ usage and expects unsignaled sends to not consume any
+	 *    space.
+	 *
+	 * 2. The overflow queue is drained via CQ poll, so the application must
+	 *    be sure to poll the CQ frequently for correctness. In other words,
+	 *    with a ud_qd_override value of 2, the user can post 32 ops and
+	 *    only the first 2 will be sent until completions are polled.
+	 */
+	uint32_t transparent_ud_qd_override;
 };
 
 extern struct irdma_env_params env;
@@ -380,6 +407,7 @@ struct irdma_post_sq_info {
 	__u8 op_type;
 	__u8 l4len;
 	bool signaled:1;
+	bool signaled_override:1;
 	bool read_fence:1;
 	bool local_fence:1;
 	bool inline_data:1;
@@ -427,6 +455,7 @@ struct irdma_cq_poll_info {
 	bool ud_vlan_valid:1;
 	bool ud_smac_valid:1;
 	bool imm_valid:1;
+	bool signaled_override:1;
 	union {
 		__u32 tcp_sqn;
 		__u32 roce_psn;
@@ -534,7 +563,7 @@ struct irdma_sq_uk_wr_trk_info {
 	__u32 wr_len;
 	__u16 quanta;
 	__u8 signaled;
-	__u8 reserved[1];
+	__u8 signaled_override;
 };
 
 struct irdma_qp_quanta {

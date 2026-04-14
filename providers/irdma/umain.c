@@ -24,6 +24,8 @@
 
 struct irdma_env_params env = {
 	.pass_cie_vendor_err = false,
+	.ud_qd_override = 0,
+	.transparent_ud_qd_override = 0,
 };
 
 unsigned int irdma_dbg;
@@ -376,9 +378,41 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 				"IRDMA_PASS_CIE_VENDOR_ERR\n", __func__, tmp);
 	}
 
+	env_val = getenv("IRDMA_UD_QD_OVERRIDE");
+	if (env_val) {
+		tmp = atoi(env_val);
+		if (tmp < 0)
+			fprintf(stderr, "Ignoring invalid IRDMA_UD_QD_OVERRIDE "
+				"value of %d\n", tmp);
+		else
+			env.ud_qd_override = tmp;
+	}
+
+
+	env_val = getenv("IRDMA_TRANSPARENT_UD_QD_OVERRIDE");
+	if (env_val) {
+		tmp = atoi(env_val);
+		if (tmp < 0)
+			fprintf(stderr, "Ignoring invalid "
+				"IRDMA_TRANSPARENT_UD_QD_OVERRIDE value of "
+				"%d\n", tmp);
+		else
+			env.transparent_ud_qd_override = tmp;
+	}
+
 	env_val = getenv("IRDMA_DEBUG");
 	if (env_val)
 		irdma_dbg = atoi(env_val);
+
+	if (irdma_dbg) {
+		printf("IRDMA provider running in debug mode.\n"
+		       "Params:\n"
+		       "\tIRDMA_PASS_CIE_VENDOR_ERR = %d\n"
+		       "\tIRDMA_UD_QD_OVERRIDE = %d\n"
+		       "\tIRDMA_TRANSPARENT_UD_QD_OVERRIDE = %d\n",
+		       env.pass_cie_vendor_err, env.ud_qd_override,
+		       env.transparent_ud_qd_override);
+	}
 
 	/* Create debug_thread only once upon first call to irdma_device_alloc
 	 * dev_allocated_refcount tracks number of devices created
