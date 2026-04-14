@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB */
-/* Copyright (C) 2019 - 2023 Intel Corporation */
+/* Copyright (C) 2019 - 2022 Intel Corporation */
 #ifndef IRDMA_UMAIN_H
 #define IRDMA_UMAIN_H
 
@@ -15,12 +15,20 @@
 #include "i40iw_hw.h"
 #include "user.h"
 
+#ifndef likely
+#define likely(x)	__builtin_expect((x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x)	__builtin_expect((x), 0)
+#endif
+#define PFX	"libirdma-"
+
 #define IRDMA_BASE_PUSH_PAGE		1
 #define IRDMA_U_MINCQ_SIZE		4
 #define IRDMA_DB_SHADOW_AREA_SIZE	64
 #define IRDMA_DB_CQ_OFFSET		64
 
-enum irdma_supported_wc_flags {
+enum irdma_supported_wc_flags_ex {
 	IRDMA_STANDARD_WC_FLAGS_EX = IBV_WC_EX_WITH_BYTE_LEN
 				    | IBV_WC_EX_WITH_IMM
 				    | IBV_WC_EX_WITH_QP_NUM
@@ -29,6 +37,34 @@ enum irdma_supported_wc_flags {
 				    | IBV_WC_EX_WITH_SL,
 	IRDMA_GEN3_WC_FLAGS_EX = IRDMA_STANDARD_WC_FLAGS_EX |
 				 IBV_WC_EX_WITH_COMPLETION_TIMESTAMP,
+};
+
+enum irdma_alloc_type {
+	IRDMA_ALLOC_TYPE_DEFAULT,
+	IRDMA_ALLOC_TYPE_KMEM,
+	IRDMA_ALLOC_TYPE_LAST,
+};
+
+enum irdma_resource_type {
+	IRDMA_RESOURCE_TYPE_CQ,
+	IRDMA_RESOURCE_TYPE_SRQ,
+	IRDMA_RESOURCE_TYPE_QP,
+	IRDMA_RESOURCE_TYPE_ANY,
+};
+
+struct irdma_resc_alloc_spec {
+	enum irdma_resource_type resc_type;
+	enum irdma_alloc_type alloc_type;
+};
+
+#define IRDMA_RESC_ALLOC_MAGIC 0xFA00FC00
+
+struct irdma_resc_alloc_config {
+	uint32_t magic;
+	uint32_t total_size;
+	uint32_t entry_size;
+	uint32_t num_entries;
+	struct irdma_resc_alloc_spec entries[];
 };
 
 struct irdma_udevice {
@@ -46,6 +82,9 @@ struct irdma_upd {
 	void *arm_cq_page;
 	void *arm_cq;
 	uint32_t pd_id;
+	struct list_node list;
+	atomic_int refcount;
+	struct irdma_upd *container_iwupd;
 };
 
 struct irdma_uvcontext {
@@ -56,6 +95,8 @@ struct irdma_uvcontext {
 	int abi_ver;
 	bool legacy_mode:1;
 	bool use_raw_attrs:1;
+	struct list_head pd_list;
+	struct irdma_spinlock pd_lock;
 };
 
 struct irdma_uqp;
@@ -65,33 +106,41 @@ struct irdma_cq_buf {
 	struct irdma_cq_uk cq;
 	struct verbs_mr vmr;
 	size_t buf_size;
+	enum irdma_alloc_type alloc_type;
 };
+
+extern struct list_head dbg_ucq_list;
+extern struct list_head dbg_uqp_list;
+extern pthread_mutex_t sigusr1_wait_mutex;
 
 struct irdma_usrq {
 	struct verbs_srq v_srq;
 	struct verbs_mr vmr;
-	pthread_spinlock_t lock;
+	struct irdma_spinlock lock;
 	struct irdma_srq_uk srq;
 	size_t buf_size;
+	enum irdma_alloc_type alloc_type;
 };
 
 struct irdma_ucq {
 	struct verbs_cq verbs_cq;
 	struct verbs_mr vmr;
 	struct verbs_mr vmr_shadow_area;
-	pthread_spinlock_t lock;
+	struct irdma_spinlock lock;
 	size_t buf_size;
+	enum irdma_alloc_type alloc_type;
 	bool is_armed;
 	bool skip_arm;
 	bool arm_sol;
 	bool skip_sol;
 	int comp_vector;
-	uint32_t report_rtt;
 	struct irdma_uqp *uqp;
 	struct irdma_cq_uk cq;
 	struct list_head resize_list;
 	/* for extended CQ completion fields */
 	struct irdma_cq_poll_info cur_cqe;
+	struct list_node dbg_entry;
+	struct ibv_pd *parent_domain;
 };
 
 struct irdma_uqp {
@@ -100,8 +149,9 @@ struct irdma_uqp {
 	struct irdma_ucq *recv_cq;
 	struct verbs_mr vmr;
 	size_t buf_size;
+	enum irdma_alloc_type alloc_type;
 	uint32_t irdma_drv_opt;
-	pthread_spinlock_t lock;
+	struct irdma_spinlock lock;
 	uint16_t sq_sig_all;
 	uint16_t qperr;
 	uint16_t rsvd;
@@ -110,12 +160,63 @@ struct irdma_uqp {
 	struct ibv_recv_wr *pend_rx_wr;
 	struct irdma_qp_uk qp;
 	enum ibv_qp_type qp_type;
+	struct list_node dbg_entry;
 };
 
-struct irdma_umr {
-	struct verbs_mr vmr;
-	uint32_t acc_flags;
+struct irdma_utd {
+	struct ibv_td ibv_td;
+	atomic_int refcount;
 };
+
+struct irdma_uparent_domain {
+	struct irdma_upd iwupd;
+	struct irdma_utd *iwutd;
+	void *(*alloc)(struct ibv_pd *pd, void *pd_context, size_t size,
+		       size_t alignment, uint64_t resource_type);
+	void (*free)(struct ibv_pd *pd, void *pd_context, void *ptr,
+		     uint64_t resource_type);
+	void *pd_context;
+};
+
+static inline struct irdma_uparent_domain *to_iw_uparent_domain(struct ibv_pd *ibv_pd)
+{
+	struct irdma_uparent_domain *iw_parent_domain =
+		container_of(ibv_pd, struct irdma_uparent_domain, iwupd.ibv_pd);
+
+	if (iw_parent_domain && iw_parent_domain->iwupd.container_iwupd)
+		return iw_parent_domain;
+
+	return NULL;
+}
+
+static inline int irdma_spin_init(struct irdma_spinlock *lock, bool skip_lock)
+{
+	lock->skip_lock = skip_lock;
+
+	if (lock->skip_lock)
+		return 0;
+
+	return pthread_spin_init(&lock->lock, PTHREAD_PROCESS_PRIVATE);
+}
+
+static inline int irdma_spin_init_pd(struct irdma_spinlock *lock, struct ibv_pd *pd)
+{
+	struct irdma_uparent_domain *iw_parent_domain = to_iw_uparent_domain(pd);
+	bool skip_lock = false;
+
+	if (iw_parent_domain && iw_parent_domain->iwutd)
+		skip_lock = true;
+
+	return irdma_spin_init(lock, skip_lock);
+}
+
+static inline int irdma_spin_destroy(struct irdma_spinlock *lock)
+{
+	if (lock->skip_lock)
+		return 0;
+
+	return pthread_spin_destroy(&lock->lock);
+}
 
 /* irdma_uverbs.c */
 int irdma_uquery_device_ex(struct ibv_context *context,
@@ -131,8 +232,10 @@ struct ibv_mr *irdma_ureg_mr_dmabuf(struct ibv_pd *pd, uint64_t offset,
 				    size_t length, uint64_t iova, int fd,
 				    int access);
 int irdma_udereg_mr(struct verbs_mr *vmr);
-int irdma_urereg_mr(struct verbs_mr *mr, int flags, struct ibv_pd *pd,
-		    void *addr, size_t length, int access);
+
+int irdma_urereg_mr(struct verbs_mr *mr, int flags, struct ibv_pd *pd, void *addr,
+		    size_t length, int access);
+
 struct ibv_mw *irdma_ualloc_mw(struct ibv_pd *pd, enum ibv_mw_type type);
 int irdma_ubind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 		   struct ibv_mw_bind *mw_bind);
@@ -177,6 +280,11 @@ int irdma_upost_srq(struct ibv_srq *ib_srq, struct ibv_recv_wr *ib_wr,
 void irdma_async_event(struct ibv_context *context,
 		       struct ibv_async_event *event);
 void irdma_set_hw_attrs(struct irdma_hw_attrs *attrs);
-void *irdma_mmap(int fd, off_t offset);
-void irdma_munmap(void *map);
+void *irdma_mmap(int fd, size_t length, off_t offset);
+void irdma_munmap(void *map, size_t length);
+struct ibv_td *irdma_ualloc_td(struct ibv_context *context,
+			       struct ibv_td_init_attr *init_attr);
+int irdma_udealloc_td(struct ibv_td *td);
+struct ibv_pd *irdma_ualloc_parent_domain(struct ibv_context *context,
+					  struct ibv_parent_domain_init_attr *int_attr);
 #endif /* IRDMA_UMAIN_H */

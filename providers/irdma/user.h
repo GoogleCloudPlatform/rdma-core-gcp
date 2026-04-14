@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB */
-/* Copyright (c) 2015 - 2023 Intel Corporation */
+/* Copyright (c) 2015 - 2022 Intel Corporation */
 #ifndef IRDMA_USER_H
 #define IRDMA_USER_H
 
@@ -19,7 +19,7 @@
 #define irdma_physical_fragment __u64
 #define irdma_address_list __u64 *
 
-#define	IRDMA_MAX_MR_SIZE       0x200000000000ULL
+#define IRDMA_MAX_MR_SIZE	0x200000000000ULL
 
 #define IRDMA_ACCESS_FLAGS_LOCALREAD		0x01
 #define IRDMA_ACCESS_FLAGS_LOCALWRITE		0x02
@@ -48,7 +48,7 @@
 #define IRDMA_OP_TYPE_REC	0x3e
 #define IRDMA_OP_TYPE_REC_IMM	0x3f
 
-#define IRDMA_FLUSH_MAJOR_ERR	1
+#define IRDMA_FLUSH_MAJOR_ERR 1
 #define IRDMA_SRQFLUSH_RSVD_MAJOR_ERR 0xfffe
 /* Async Events codes */
 #define IRDMA_AE_AMP_UNALLOCATED_STAG					0x0102
@@ -116,6 +116,8 @@
 #define IRDMA_AE_ROE_INVALID_RDMA_READ_REQUEST				0x0313
 #define IRDMA_AE_ROE_INVALID_RDMA_WRITE_OR_READ_RESP			0x0314
 #define IRDMA_AE_ROCE_RSP_LENGTH_ERROR					0x0316
+#define IRDMA_AE_INVALID_RSN_GAP_IN_RSN					0x0317
+#define IRDMA_AE_ROCE_REQ_LENGTH_ERROR					0x0318
 #define IRDMA_AE_ROCE_EMPTY_MCG						0x0380
 #define IRDMA_AE_ROCE_BAD_MC_IP_ADDR					0x0381
 #define IRDMA_AE_ROCE_BAD_MC_QPID					0x0382
@@ -147,6 +149,8 @@
 #define IRDMA_AE_REMOTE_QP_CATASTROPHIC					0x0703
 #define IRDMA_AE_LOCAL_QP_CATASTROPHIC					0x0704
 #define IRDMA_AE_RCE_QP_CATASTROPHIC					0x0705
+#define IRDMA_AE_RCE_ADAPTER_CATASTROPHIC				0x0706
+#define IRDMA_AE_LCE_CRC_FUNCTION_CATASTROPHIC				0x0707
 #define IRDMA_AE_QP_SUSPEND_COMPLETE					0x0900
 #define IRDMA_AE_CQP_DEFERRED_COMPLETE					0x0901
 #define IRDMA_AE_ADAPTER_CATASTROPHIC					0x0B0B
@@ -162,27 +166,23 @@ enum irdma_device_caps_const {
 	IRDMA_SHADOW_AREA_SIZE =		8,
 	IRDMA_GATHER_STATS_BUF_SIZE =		1024,
 	IRDMA_MIN_IW_QP_ID =			0,
-	IRDMA_QUERY_FPM_BUF_SIZE =		176,
-	IRDMA_COMMIT_FPM_BUF_SIZE =		176,
-	IRDMA_MAX_IW_QP_ID =			262143,
+	IRDMA_QUERY_FPM_BUF_SIZE =		200,
+	IRDMA_COMMIT_FPM_BUF_SIZE =		208,
 	IRDMA_MIN_CEQID =			0,
 	IRDMA_MAX_CEQID =			1023,
 	IRDMA_CEQ_MAX_COUNT =			IRDMA_MAX_CEQID + 1,
 	IRDMA_MIN_CQID =			0,
-	IRDMA_MAX_CQID =			524287,
 	IRDMA_MIN_AEQ_ENTRIES =			1,
 	IRDMA_MAX_AEQ_ENTRIES =			524287,
+	IRDMA_MAX_AEQ_ENTRIES_GEN_3 =		262144,
 	IRDMA_MIN_CEQ_ENTRIES =			1,
 	IRDMA_MAX_CEQ_ENTRIES =			262143,
 	IRDMA_MIN_CQ_SIZE =			1,
 	IRDMA_MAX_CQ_SIZE =			1048575,
 	IRDMA_DB_ID_ZERO =			0,
-	IRDMA_MAX_WQ_FRAGMENT_COUNT =		13,
-	IRDMA_MAX_SGE_RD =			13,
 	IRDMA_MAX_OUTBOUND_MSG_SIZE =		2147483647,
 	IRDMA_MAX_INBOUND_MSG_SIZE =		2147483647,
-	IRDMA_MAX_PUSH_PAGE_COUNT =		1024,
-	IRDMA_MAX_PE_ENA_VF_COUNT =		32,
+	IRDMA_MAX_PE_ENA_VF_COUNT =             32,
 	IRDMA_MAX_VF_FPM_ID =			47,
 	IRDMA_MAX_SQ_PAYLOAD_SIZE =		2145386496,
 	IRDMA_MAX_INLINE_DATA_SIZE =		101,
@@ -265,10 +265,18 @@ struct irdma_cq_uk;
 struct irdma_qp_uk_init_info;
 struct irdma_cq_uk_init_info;
 
+struct irdma_spinlock {
+	pthread_spinlock_t lock;
+	bool skip_lock;
+};
+
 struct irdma_ring {
 	__u32 head;
 	__u32 tail;
 	__u32 size;
+	__u32 user_size;
+	_Atomic(int) post_cnt;
+	__u32 unsig_post_cnt;
 };
 
 struct irdma_cqe {
@@ -277,6 +285,16 @@ struct irdma_cqe {
 
 struct irdma_extended_cqe {
 	__le64 buf[IRDMA_EXTENDED_CQE_SIZE];
+};
+
+struct irdma_post_send_combined_inline_sge {
+	struct ibv_sge *sg_list;
+	void *data;
+	__u32 num_sges;
+	__u32 len;
+	__u32 ah_id;
+	__u32 qkey;
+	__u32 dest_qp;
 };
 
 struct irdma_post_send {
@@ -291,6 +309,14 @@ struct irdma_post_rq_info {
 	__u64 wr_id;
 	struct ibv_sge *sg_list;
 	__u32 num_sges;
+};
+
+struct irdma_rdma_write_combined_inline_sge {
+	struct ibv_sge *lo_sg_list;
+	void *data;
+	__u32 num_lo_sges;
+	__u32 len;
+	struct ibv_sge rem_addr;
 };
 
 struct irdma_rdma_write {
@@ -362,6 +388,8 @@ struct irdma_post_sq_info {
 		struct irdma_inv_local_stag inv_local_stag;
 		struct irdma_atomic_fetch_add atomic_fetch_add;
 		struct irdma_atomic_compare_swap atomic_compare_swap;
+		struct irdma_rdma_write_combined_inline_sge rdma_write_combined_sge_inline;
+		struct irdma_post_send_combined_inline_sge send_combined_sge_inline;
 	} op;
 };
 
@@ -428,8 +456,7 @@ int irdma_uk_stag_local_invalidate(struct irdma_qp_uk *qp,
 				   bool post_sq);
 
 struct irdma_wqe_uk_ops {
-	void (*iw_copy_inline_data)(__u8 *dest, struct ibv_sge *sge_list,
-				    __u32 num_sges, __u8 polarity);
+	void (*iw_copy_inline_data)(__u8 *dest, struct ibv_sge *sge_list, __u32 num_sges, __u8 polarity);
 	__u16 (*iw_inline_data_size_to_quanta)(__u32 data_size);
 	void (*iw_set_fragment)(__le64 *wqe, __u32 offset, struct ibv_sge *sge,
 				__u8 valid);
@@ -437,6 +464,7 @@ struct irdma_wqe_uk_ops {
 				   struct irdma_bind_window *op_info);
 };
 
+bool irdma_uk_cq_empty(struct irdma_cq_uk *cq);
 int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			  struct irdma_cq_poll_info *info);
 void irdma_uk_cq_request_notification(struct irdma_cq_uk *cq,
@@ -471,6 +499,7 @@ struct irdma_srq_uk {
 	__u8 wqe_size;
 	__u8 wqe_size_multiplier;
 	__u8 deferred_flag;
+	struct irdma_spinlock *lock;
 };
 
 struct irdma_srq_uk_init_info {
@@ -484,11 +513,17 @@ struct irdma_srq_uk_init_info {
 	__u32 max_srq_frag_cnt;
 };
 
+struct irdma_sig_wr_trk_info {
+	__u32 wqe_idx;
+	__u32 post_cnt;
+};
+
 struct irdma_sq_uk_wr_trk_info {
 	__u64 wrid;
 	__u32 wr_len;
 	__u16 quanta;
-	__u8 reserved[2];
+	__u8 signaled;
+	__u8 reserved[1];
 };
 
 struct irdma_qp_quanta {
@@ -502,11 +537,15 @@ struct irdma_qp_uk {
 	struct irdma_uk_attrs *uk_attrs;
 	__u32 *wqe_alloc_db;
 	struct irdma_sq_uk_wr_trk_info *sq_wrtrk_array;
+	struct irdma_sig_wr_trk_info *sq_sigwrtrk_array;
 	__u64 *rq_wrid_array;
 	__le64 *shadow_area;
-	__le32 *push_db;
+	__le64 *push_db;
 	__le64 *push_wqe;
+	void *push_db_map;
+	void *push_wqe_map;
 	struct irdma_ring sq_ring;
+	struct irdma_ring sq_sig_ring;
 	struct irdma_ring rq_ring;
 	struct irdma_ring initial_ring;
 	__u32 qp_id;
@@ -524,6 +563,7 @@ struct irdma_qp_uk {
 	__u8 rwqe_polarity;
 	__u8 rq_wqe_size;
 	__u8 rq_wqe_size_multiplier;
+	__u8 start_wqe_idx;
 	bool deferred_flag:1;
 	bool push_mode:1; /* whether the last post wqe was pushed */
 	bool push_dropped:1;
@@ -531,11 +571,12 @@ struct irdma_qp_uk {
 	bool sq_flush_complete:1; /* Indicates flush was seen and SQ was empty after the flush */
 	bool rq_flush_complete:1; /* Indicates flush was seen and RQ was empty after the flush */
 	bool destroy_pending:1; /* Indicates the QP is being destroyed */
+	bool last_push_db:1; /* Indicates last DB was push DB */
 	void *back_qp;
-	pthread_spinlock_t *lock;
+	struct irdma_spinlock *lock;
 	__u8 dbg_rq_flushed;
-	__u8 sq_flush_seen;
-	__u8 rq_flush_seen;
+	__u16 ord_cnt;
+	__u8 rd_fence_rate;
 };
 
 struct irdma_cq_uk {
@@ -558,6 +599,7 @@ struct irdma_qp_uk_init_info {
 	__u32 *wqe_alloc_db;
 	__le64 *shadow_area;
 	struct irdma_sq_uk_wr_trk_info *sq_wrtrk_array;
+	struct irdma_sig_wr_trk_info *sq_sigwrtrk_array;
 	__u64 *rq_wrid_array;
 	__u32 qp_id;
 	__u32 qp_caps;
@@ -569,9 +611,11 @@ struct irdma_qp_uk_init_info {
 	__u32 sq_depth;
 	__u32 rq_depth;
 	__u8 first_sq_wq;
+	__u8 start_wqe_idx;
 	__u8 type;
 	__u8 sq_shift;
 	__u8 rq_shift;
+	__u8 rd_fence_rate;
 	int abi_ver;
 	bool legacy_mode;
 };
@@ -586,8 +630,10 @@ struct irdma_cq_uk_init_info {
 	bool avoid_mem_cflct;
 };
 
+void irdma_print_cqes(struct irdma_cq_uk *cq);
+void irdma_print_sq_wqes(struct irdma_qp_uk *qp);
 __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
-				   __u16 quanta, __u32 total_size,
+				   __u16 *quanta, __u32 total_size,
 				   struct irdma_post_sq_info *info);
 __le64 *irdma_srq_get_next_recv_wqe(struct irdma_srq_uk *srq, __u32 *wqe_idx);
 __le64 *irdma_qp_get_next_recv_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx);
@@ -604,7 +650,7 @@ int irdma_get_rqdepth(struct irdma_uk_attrs *uk_attrs, __u32 rq_size,
 int irdma_get_srqdepth(struct irdma_uk_attrs *uk_attrs, __u32 srq_size,
 		       __u8 shift, __u32 *srqdepth);
 void irdma_qp_push_wqe(struct irdma_qp_uk *qp, __le64 *wqe, __u16 quanta,
-		       __u32 wqe_idx, bool post_sq);
+		       __u32 wqe_idx, bool push_wqe);
 void irdma_clr_wqes(struct irdma_qp_uk *qp, __u32 qp_wqe_idx);
 
 static inline struct qp_err_code irdma_ae_to_qp_err_code(__u16 ae_id)
@@ -661,6 +707,7 @@ static inline struct qp_err_code irdma_ae_to_qp_err_code(__u16 ae_id)
 	case IRDMA_AE_LLP_SEGMENT_TOO_SMALL:
 	case IRDMA_AE_LLP_RECEIVED_MPA_CRC_ERROR:
 	case IRDMA_AE_ROCE_RSP_LENGTH_ERROR:
+	case IRDMA_AE_ROCE_REQ_LENGTH_ERROR:
 	case IRDMA_AE_IB_REMOTE_OP_ERROR:
 		qp_err.flush_code = FLUSH_REM_OP_ERR;
 		qp_err.event_type = IRDMA_QP_EVENT_CATASTROPHIC;
@@ -683,5 +730,22 @@ static inline struct qp_err_code irdma_ae_to_qp_err_code(__u16 ae_id)
 	}
 
 	return qp_err;
+}
+
+static inline int irdma_spin_lock(struct irdma_spinlock *lock)
+{
+	if (lock->skip_lock)
+		return 0;
+
+	return pthread_spin_lock(&lock->lock);
+}
+
+static inline int irdma_spin_unlock(struct irdma_spinlock *lock)
+{
+	if (lock->skip_lock)
+		return 0;
+
+	return pthread_spin_unlock(&lock->lock);
+
 }
 #endif /* IRDMA_USER_H */
