@@ -6,6 +6,7 @@
 #define PCI_VENDOR_ID_INTEL		0x8086
 
 /* Device IDs */
+#define IAVF_DEV_ID_ADAPTIVE_VF         0x1889
 /* Intel(R) Ethernet Connection E823-L for backplane */
 #define ICE_DEV_ID_E823L_BACKPLANE      0x124C
 /* Intel(R) Ethernet Connection E823-L for SFP */
@@ -57,3 +58,4 @@
 /* Intel(R) Ethernet Connection E822-L 1GbE */
 #define ICE_DEV_ID_E822L_SGMII          0x189A
 #endif /* ICE_DEVIDS_H */
+
