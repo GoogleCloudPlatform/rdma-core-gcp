@@ -275,6 +275,12 @@ __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
 	qp->sq_wrtrk_array[*wqe_idx].wr_len = total_size;
 	qp->sq_wrtrk_array[*wqe_idx].quanta = wqe_quanta;
 	qp->sq_wrtrk_array[*wqe_idx].signaled = info->signaled;
+	/* UD queue depth override requires all sends to be signaled. This is to
+	 * track whether the user really intended for this send to be signaled
+	 * or not.
+	 */
+	qp->sq_wrtrk_array[*wqe_idx].signaled_override =
+		info->signaled_override;
 	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
 		atomic_fetch_add(&qp->sq_ring.post_cnt, 1);
 		if (info->signaled) {
@@ -1568,6 +1574,8 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		}
 		pring = &qp->rq_ring;
 	} else { /* q_type is IRDMA_CQE_QTYPE_SQ */
+		info->signaled_override =
+			qp->sq_wrtrk_array[wqe_idx].signaled_override;
 		if (qp->first_sq_wq) {
 			if (wqe_idx + 1 >= qp->conn_wqes)
 				qp->first_sq_wq = false;

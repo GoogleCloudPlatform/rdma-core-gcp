@@ -1252,6 +1252,33 @@ static void irdma_process_cqe(struct ibv_wc *entry, struct irdma_cq_poll_info *c
 	entry->byte_len = cur_cqe->bytes_xfered;
 }
 
+static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
+			      struct ibv_send_wr **bad_wr);
+
+/**
+ * irdma_handle_deferred_ud - Check for and handle the UD deferred SQ.
+ * @qp: irdma qp
+ *
+ * Context: QP lock must be held.
+ */
+static void irdma_handle_deferred_ud(struct irdma_uqp *qp)
+{
+	struct ibv_send_wr *bad_wr;
+	struct ibv_send_wr *wr;
+	const uint32_t masked_cons = qp->ud_ring.cons &
+		(qp->ud_ring.ring_size - 1u);
+
+	if (qp->ud_ring.cons == qp->ud_ring.prod)
+		return;
+
+	wr = &qp->ud_ring.entry[masked_cons].wqe;
+	/* SG len is carried over from WQE, just fix up to point to local SG. */
+	wr->sg_list = qp->ud_ring.entry[masked_cons].sgl;
+	qp->ud_ring.cons++;
+
+	__irdma_upost_send(&qp->ibv_qp, wr, &bad_wr);
+}
+
 /**
  * irdma_poll_one - poll one entry of the CQ
  * @ukcq: ukcq to poll
@@ -1267,6 +1294,28 @@ static int irdma_poll_one(struct irdma_cq_uk *ukcq, struct irdma_cq_poll_info *c
 
 	if (ret)
 		return ret;
+
+	/* Handle UD queue depth limit/deferred submission. */
+	if (env.transparent_ud_qd_override) {
+		struct irdma_qp_uk *qp = cur_cqe->qp_handle;
+		struct ibv_qp *ib_qp = qp->back_qp;
+		struct irdma_uqp *iwuqp = container_of(ib_qp, struct irdma_uqp,
+						       ibv_qp);
+
+		if (ib_qp->qp_type == IBV_QPT_UD &&
+		    cur_cqe->q_type == IRDMA_CQE_QTYPE_SQ) {
+			irdma_spin_lock(&iwuqp->lock);
+			if (!iwuqp->ud_ring.delete_in_progress) {
+				iwuqp->ud_ring.active--;
+				irdma_handle_deferred_ud(iwuqp);
+			}
+			irdma_spin_unlock(&iwuqp->lock);
+		}
+
+		/* Was this WQE originally signaled? Just consume it if not. */
+		if (cur_cqe->signaled_override)
+			return ENOENT;
+	}
 
 	if (!entry)
 		irdma_process_cqe_ext(cur_cqe);
@@ -1978,6 +2027,27 @@ struct ibv_qp *irdma_ucreate_qp(struct ibv_pd *pd,
 
 	iwuqp->qp.sq_ring.user_size = attr->cap.max_send_wr;
 
+	if (env.ud_qd_override && attr->qp_type == IBV_QPT_UD)
+		attr->cap.max_send_wr = env.ud_qd_override;
+
+	if (env.transparent_ud_qd_override && attr->qp_type == IBV_QPT_UD) {
+		uint32_t ring_size = attr->cap.max_send_wr;
+
+		if ((ring_size - 1u) & ring_size) {
+			/* Not a power of 2, so round up. */
+			ring_size = 1u << ((CHAR_BIT * sizeof(unsigned int)) -
+					   __builtin_clz(ring_size));
+		}
+
+		iwuqp->ud_ring.entry = calloc(ring_size,
+					      sizeof(struct ud_ring_entry));
+		if (!iwuqp->ud_ring.entry) {
+			status = errno; /* preserve errno */
+			goto err_free_vmap_qp;
+		}
+		iwuqp->ud_ring.ring_size = ring_size;
+	}
+
 	pthread_mutex_lock(&sigusr1_wait_mutex);
 	list_add(&dbg_uqp_list, &iwuqp->dbg_entry);
 	pthread_mutex_unlock(&sigusr1_wait_mutex);
@@ -2117,12 +2187,23 @@ int irdma_udestroy_qp(struct ibv_qp *qp)
 	int ret;
 
 	iwuqp = container_of(qp, struct irdma_uqp, ibv_qp);
+
+	if (env.transparent_ud_qd_override &&
+	    iwuqp->ibv_qp.qp_type == IBV_QPT_UD) {
+		/* If transparent UD QD limit is enabled, mark the QP as going
+		 * down so that a concurrent CQ poll doesn't attempt to post a
+		 * WQE during the deletion. The user is supposed to ensure that
+		 * they don't post to a QP being deleted, but they do not know
+		 * that polling a CQ may indirectly result in a QP post.
+		 */
+		irdma_spin_lock(&iwuqp->lock);
+		iwuqp->ud_ring.delete_in_progress = true;
+		irdma_spin_unlock(&iwuqp->lock);
+	}
+
 	pthread_mutex_lock(&sigusr1_wait_mutex);
 	list_del(&iwuqp->dbg_entry);
 	pthread_mutex_unlock(&sigusr1_wait_mutex);
-	ret = irdma_spin_destroy(&iwuqp->lock);
-	if (ret)
-		goto err;
 
 	ret = irdma_destroy_vmapped_qp(iwuqp);
 	if (ret)
@@ -2141,8 +2222,11 @@ int irdma_udestroy_qp(struct ibv_qp *qp)
 		free(iwuqp->qp.sq_wrtrk_array);
 	if (iwuqp->qp.rq_wrid_array)
 		free(iwuqp->qp.rq_wrid_array);
+	if (env.transparent_ud_qd_override && iwuqp->ud_ring.entry)
+		free(iwuqp->ud_ring.entry);
 
 	irdma_free_buf(iwuqp->qp.sq_base, iwuqp->buf_size, iwuqp->alloc_type);
+	irdma_spin_destroy(&iwuqp->lock);
 	free(iwuqp);
 	return 0;
 
@@ -2168,13 +2252,61 @@ static inline __u32 calc_type2_mw_stag(__u32 rkey, __u32 mw_rkey)
 }
 
 /**
- * irdma_post_send -  post send wr for user application
+ * irdma_enqueue_deferred_ud - Add a WQE to the UD backlog.
+ * @iwuqp: irdma qp.
+ * @wr: ib wr
+ *
+ * Context: Assumes QP lock is held.
+ */
+static void irdma_enqueue_deferred_ud(struct irdma_uqp *iwuqp,
+				      struct ibv_send_wr *wr)
+{
+	size_t i;
+	uint64_t inl_len = 0;
+	const uint32_t masked_prod = iwuqp->ud_ring.prod &
+		(iwuqp->ud_ring.ring_size - 1u);
+
+	iwuqp->ud_ring.entry[masked_prod].wqe = *wr;
+	iwuqp->ud_ring.entry[masked_prod].wqe.next = NULL;
+
+	if (wr->send_flags & IBV_SEND_INLINE) {
+		/* Inline data needs to be copied now. */
+		for (i = 0; i < wr->num_sge; i++) {
+			if ((inl_len + wr->sg_list[i].length) > UD_MAX_INLINE)
+				break;
+
+			memcpy(&iwuqp->ud_ring.entry[masked_prod].
+			       inline_data[inl_len],
+			       (void *)wr->sg_list[i].addr,
+			       wr->sg_list[i].length);
+
+			inl_len += wr->sg_list[i].length;
+		}
+
+		/* Override sg info to point to the inline data buffer. */
+		iwuqp->ud_ring.entry[masked_prod].wqe.num_sge = 1;
+		iwuqp->ud_ring.entry[masked_prod].sgl[0].addr =
+			(uint64_t)iwuqp->ud_ring.entry[masked_prod].inline_data;
+		iwuqp->ud_ring.entry[masked_prod].sgl[0].length = inl_len;
+	} else {
+		for (i = 0; i < wr->num_sge; i++)
+			iwuqp->ud_ring.entry[masked_prod].sgl[i] =
+			wr->sg_list[i];
+	}
+
+	iwuqp->ud_ring.prod++;
+}
+
+/**
+ * __irdma_post_send -  post send wr for user application
  * @ib_qp: qp to post wr
  * @ib_wr: work request ptr
  * @bad_wr: return of bad wr if err
+ *
+ * Context: Assumes QP lock is held.
  */
-int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
-		     struct ibv_send_wr **bad_wr)
+static int __irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
+			      struct ibv_send_wr **bad_wr)
 {
 	struct irdma_post_sq_info info;
 	struct irdma_uvcontext *iwvctx;
@@ -2188,15 +2320,22 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 			      ibv_ctx.context);
 	uk_attrs = &iwvctx->uk_attrs;
 
-	err = irdma_spin_lock(&iwuqp->lock);
-	if (err)
-		return err;
-
 	if (!IRDMA_RING_MORE_WORK(iwuqp->qp.sq_ring) &&
 	    ib_qp->state == IBV_QPS_ERR)
 		reflush = true;
 
 	while (ib_wr) {
+		if (env.transparent_ud_qd_override &&
+		    ib_qp->qp_type == IBV_QPT_UD) {
+			if (iwuqp->ud_ring.active >=
+			    env.transparent_ud_qd_override) {
+				/* HW limit is reached, queue it for later. */
+				irdma_enqueue_deferred_ud(iwuqp, ib_wr);
+				ib_wr = ib_wr->next;
+				continue;
+			}
+		}
+
 		memset(&info, 0, sizeof(info));
 		info.wr_id = (__u64)(ib_wr->wr_id);
 		if ((ib_wr->send_flags & IBV_SEND_SIGNALED) ||
@@ -2271,6 +2410,14 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 				info.op.send.ah_id = ah->ah_id;
 				info.op.send.qkey = ib_wr->wr.ud.remote_qkey;
 				info.op.send.dest_qp = ib_wr->wr.ud.remote_qpn;
+
+				if (env.transparent_ud_qd_override) {
+					iwuqp->ud_ring.active++;
+					if (!info.signaled) {
+						info.signaled = true;
+						info.signaled_override = true;
+					}
+				}
 			}
 
 			if (ib_wr->send_flags & IBV_SEND_INLINE)
@@ -2381,6 +2528,29 @@ int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
 		irdma_uk_qp_post_wr(&iwuqp->qp);
 	if (reflush)
 		irdma_issue_flush(ib_qp, 1, 0);
+
+	return err;
+}
+
+/**
+ * irdma_post_send -  post send wr for user application
+ * @ib_qp: qp to post wr
+ * @ib_wr: work request ptr
+ * @bad_wr: return of bad wr if err
+ */
+int irdma_upost_send(struct ibv_qp *ib_qp, struct ibv_send_wr *ib_wr,
+		     struct ibv_send_wr **bad_wr)
+{
+	struct irdma_uqp *iwuqp;
+	int err;
+
+	iwuqp = container_of(ib_qp, struct irdma_uqp, ibv_qp);
+
+	err = irdma_spin_lock(&iwuqp->lock);
+	if (err)
+		return err;
+
+	err = __irdma_upost_send(ib_qp, ib_wr, bad_wr);
 
 	irdma_spin_unlock(&iwuqp->lock);
 

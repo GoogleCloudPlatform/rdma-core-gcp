@@ -160,6 +160,20 @@ struct irdma_uqp {
 	struct irdma_qp_uk qp;
 	enum ibv_qp_type qp_type;
 	struct list_node dbg_entry;
+#define UD_MAX_SGE 14u
+#define UD_MAX_INLINE 256u
+	struct {
+		uint32_t prod;
+		uint32_t cons;
+		uint32_t active;
+		uint32_t ring_size;
+		struct ud_ring_entry {
+			struct ibv_send_wr wqe;
+			struct ibv_sge sgl[UD_MAX_SGE];
+			uint8_t inline_data[UD_MAX_INLINE];
+		} *entry;
+		bool delete_in_progress;
+	} ud_ring;
 };
 
 struct irdma_utd {
