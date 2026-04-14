@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
 /* Copyright (c) 2015 - 2023 Intel Corporation */
-#include <errno.h>
-
 #include "osdep.h"
 #include "defs.h"
 #include "user.h"
@@ -54,15 +52,24 @@ static void irdma_set_fragment_gen_1(__le64 *wqe, __u32 offset,
 }
 
 /**
+ * irdma_nop_hdr - Format header section of noop WQE
+ * @qp: hw qp ptr
+ */
+static inline __u64 irdma_nop_hdr(struct irdma_qp_uk *qp)
+{
+	return FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_NOP) |
+	       FIELD_PREP(IRDMAQPSQ_SIGCOMPL, false) |
+	       FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
+}
+
+/**
  * irdma_nop_1 - insert a NOP wqe
  * @qp: hw qp ptr
  */
 static int irdma_nop_1(struct irdma_qp_uk *qp)
 {
-	__u64 hdr;
 	__le64 *wqe;
 	__u32 wqe_idx;
-	bool signaled = false;
 
 	if (!qp->sq_ring.head)
 		return EINVAL;
@@ -76,14 +83,10 @@ static int irdma_nop_1(struct irdma_qp_uk *qp)
 	set_64bit_val(wqe, 8, 0);
 	set_64bit_val(wqe, 16, 0);
 
-	hdr = FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_NOP) |
-	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, signaled) |
-	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
-
 	/* make sure WQE is written before valid bit is set */
 	udma_to_device_barrier();
 
-	set_64bit_val(wqe, 24, hdr);
+	set_64bit_val(wqe, 24, irdma_nop_hdr(qp));
 
 	return 0;
 }
@@ -95,16 +98,18 @@ static int irdma_nop_1(struct irdma_qp_uk *qp)
  */
 void irdma_clr_wqes(struct irdma_qp_uk *qp, __u32 qp_wqe_idx)
 {
-	__le64 *wqe;
+	struct irdma_qp_quanta *sq;
 	__u32 wqe_idx;
 
 	if (!(qp_wqe_idx & 0x7F)) {
 		wqe_idx = (qp_wqe_idx + 128) % qp->sq_ring.size;
-		wqe = qp->sq_base[wqe_idx].elem;
+		sq = qp->sq_base + wqe_idx;
 		if (wqe_idx)
-			memset(wqe, qp->swqe_polarity ? 0 : 0xFF, 0x1000);
+			memset(sq, qp->swqe_polarity ? 0 : 0xFF,
+			       128 * sizeof(*sq));
 		else
-			memset(wqe, qp->swqe_polarity ? 0xFF : 0, 0x1000);
+			memset(sq, qp->swqe_polarity ? 0xFF : 0,
+			       128 * sizeof(*sq));
 	}
 }
 
@@ -117,7 +122,7 @@ void irdma_uk_qp_post_wr(struct irdma_qp_uk *qp)
 	/* valid bit is written before ringing doorbell */
 	udma_to_device_barrier();
 
-	db_wr32(qp->qp_id, qp->wqe_alloc_db);
+	mmio_write32(qp->wqe_alloc_db, qp->qp_id);
 	qp->initial_ring.head = qp->sq_ring.head;
 }
 
@@ -128,59 +133,116 @@ void irdma_uk_qp_post_wr(struct irdma_qp_uk *qp)
  */
 static void irdma_qp_ring_push_db(struct irdma_qp_uk *qp, __u32 wqe_idx)
 {
-	set_32bit_val(qp->push_db, 0,
-		      FIELD_PREP(IRDMA_WQEALLOC_WQE_DESC_INDEX, wqe_idx >> 3) | qp->qp_id);
+	if (qp->uk_attrs->hw_rev >= IRDMA_GEN_3) {
+		set_64bit_val(qp->push_db, 0,
+			      FIELD_PREP(IRDMA_WQEALLOC_WQE_DESC_INDEX_64, wqe_idx >> 3) | qp->qp_id);
+	} else {
+		set_32bit_val((__le32 *)qp->push_db, 0,
+			      FIELD_PREP(IRDMA_WQEALLOC_WQE_DESC_INDEX, wqe_idx >> 3) | qp->qp_id);
+	}
 	qp->initial_ring.head = qp->sq_ring.head;
 	qp->push_mode = true;
 	qp->push_dropped = false;
 }
 
+/**
+ * irdma_qp_push_wqe -  setup push wqe and ring db
+ * @qp: hw qp ptr
+ * @wqe: wqe ptr
+ * @quanta: numbers of quanta in wqe
+ * @wqe_idx: wqe index
+ * @push_wqe: if to use push for the wqe
+ */
 void irdma_qp_push_wqe(struct irdma_qp_uk *qp, __le64 *wqe, __u16 quanta,
-		       __u32 wqe_idx, bool post_sq)
+		       __u32 wqe_idx, bool push_wqe)
 {
 	__le64 *push;
 
-	if (IRDMA_RING_CURRENT_HEAD(qp->initial_ring) !=
-		    IRDMA_RING_CURRENT_TAIL(qp->sq_ring) &&
-	    !qp->push_mode) {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	} else {
+	if (push_wqe) {
 		push = (__le64 *)((uintptr_t)qp->push_wqe +
 				  (wqe_idx & 0x7) * 0x20);
-		memcpy(push, wqe, quanta * IRDMA_QP_WQE_MIN_SIZE);
+		mmio_memcpy_x64(push, wqe, quanta * IRDMA_QP_WQE_MIN_SIZE);
 		irdma_qp_ring_push_db(qp, wqe_idx);
+		qp->last_push_db = true;
+	} else if (qp->last_push_db) {
+		qp->last_push_db = false;
+		mmio_write32(qp->wqe_alloc_db, qp->qp_id);
+	} else {
+		irdma_uk_qp_post_wr(qp);
 	}
+}
+
+/**
+ * irdma_push_ring_free -  check if sq ring free to pust push wqe
+ * @qp: hw qp ptr
+ */
+static inline bool irdma_push_ring_free(struct irdma_qp_uk *qp)
+{
+	__u32 head, tail;
+
+	head = IRDMA_RING_CURRENT_HEAD(qp->initial_ring);
+	tail = IRDMA_RING_CURRENT_TAIL(qp->sq_ring);
+
+	if (head == tail || head == (tail + 1))
+		return true;
+
+	return false;
+}
+
+/**
+ * irdma_enable_push_wqe - depending on sq ring and total size
+ * @qp: hw qp ptr
+ * @total_size: total data size
+ */
+static inline bool irdma_enable_push_wqe(struct irdma_qp_uk *qp, __u32 total_size)
+{
+	if (irdma_push_ring_free(qp) &&
+		total_size <= qp->uk_attrs->max_hw_push_len) {
+		return true;
+	}
+	return false;
 }
 
 /**
  * irdma_qp_get_next_send_wqe - pad with NOP if needed, return where next WR should go
  * @qp: hw qp ptr
  * @wqe_idx: return wqe index
- * @quanta: size of WR in quanta
+ * @quanta: (in/out) ptr to size of WR in quanta. Modified in case pad is needed
  * @total_size: size of WR in bytes
  * @info: info on WR
  */
 __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
-				   __u16 quanta, __u32 total_size,
+				   __u16 *quanta, __u32 total_size,
 				   struct irdma_post_sq_info *info)
 {
 	__le64 *wqe;
 	__le64 *wqe_0 = NULL;
 	__u32 nop_wqe_idx;
+	__u16 wqe_quanta = *quanta;
+	bool push_wqe_pad = false;
 	__u16 avail_quanta;
 	__u16 i;
+	__u32 idx;
 
+	if ((qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) &&
+	    atomic_load(&qp->sq_ring.post_cnt) >= qp->sq_ring.user_size)
+		return NULL;
+
+	if (qp->push_db && (*quanta & 0x1)) {
+		*quanta = *quanta + 1;
+		push_wqe_pad = true;
+	}
 	avail_quanta = qp->uk_attrs->max_hw_sq_chunk -
 		       (IRDMA_RING_CURRENT_HEAD(qp->sq_ring) %
 		       qp->uk_attrs->max_hw_sq_chunk);
-	if (quanta <= avail_quanta) {
+
+	if (*quanta <= avail_quanta) {
 		/* WR fits in current chunk */
-		if (quanta > IRDMA_SQ_RING_FREE_QUANTA(qp->sq_ring))
+		if (*quanta > IRDMA_SQ_RING_FREE_QUANTA(qp->sq_ring))
 			return NULL;
 	} else {
 		/* Need to pad with NOP */
-		if (quanta + avail_quanta >
+		if (*quanta + avail_quanta >
 			IRDMA_SQ_RING_FREE_QUANTA(qp->sq_ring))
 			return NULL;
 
@@ -198,17 +260,67 @@ __le64 *irdma_qp_get_next_send_wqe(struct irdma_qp_uk *qp, __u32 *wqe_idx,
 	if (!*wqe_idx)
 		qp->swqe_polarity = !qp->swqe_polarity;
 
-	IRDMA_RING_MOVE_HEAD_BY_COUNT_NOCHECK(qp->sq_ring, quanta);
+	IRDMA_RING_MOVE_HEAD_BY_COUNT_NOCHECK(qp->sq_ring, *quanta);
+
+	irdma_clr_wqes(qp, *wqe_idx);
 
 	wqe = qp->sq_base[*wqe_idx].elem;
-	if (qp->uk_attrs->hw_rev == IRDMA_GEN_1 && quanta == 1 &&
+	if (qp->uk_attrs->hw_rev == IRDMA_GEN_1 && wqe_quanta == 1 &&
 	    (IRDMA_RING_CURRENT_HEAD(qp->sq_ring) & 1)) {
 		wqe_0 = qp->sq_base[IRDMA_RING_CURRENT_HEAD(qp->sq_ring)].elem;
-		wqe_0[3] = htole64(FIELD_PREP(IRDMAQPSQ_VALID, !qp->swqe_polarity));
+		wqe_0[3] = htole64(FIELD_PREP(IRDMAQPSQ_VALID,
+						  qp->swqe_polarity ? 0 : 1));
 	}
 	qp->sq_wrtrk_array[*wqe_idx].wrid = info->wr_id;
 	qp->sq_wrtrk_array[*wqe_idx].wr_len = total_size;
-	qp->sq_wrtrk_array[*wqe_idx].quanta = quanta;
+	qp->sq_wrtrk_array[*wqe_idx].quanta = wqe_quanta;
+	qp->sq_wrtrk_array[*wqe_idx].signaled = info->signaled;
+	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
+		atomic_fetch_add(&qp->sq_ring.post_cnt, 1);
+		if (info->signaled) {
+			idx = IRDMA_RING_CURRENT_HEAD(qp->sq_sig_ring);
+			qp->sq_sigwrtrk_array[idx].wqe_idx = *wqe_idx;
+			qp->sq_sigwrtrk_array[idx].post_cnt =
+				1 + qp->sq_ring.unsig_post_cnt;
+			qp->sq_ring.unsig_post_cnt = 0;
+			IRDMA_RING_MOVE_HEAD_NOCHECK(qp->sq_sig_ring);
+		} else {
+			qp->sq_ring.unsig_post_cnt++;
+		}
+	}
+
+	/* Push mode to WC memory requires multiples of 64-byte block writes. */
+	if (push_wqe_pad) {
+		__le64 *push_wqe;
+
+		nop_wqe_idx = *wqe_idx + wqe_quanta;
+		push_wqe = qp->sq_base[nop_wqe_idx].elem;
+		qp->sq_wrtrk_array[nop_wqe_idx].quanta = IRDMA_QP_WQE_MIN_QUANTA;
+
+		set_64bit_val(push_wqe, 0, 0);
+		set_64bit_val(push_wqe, 8, 0);
+		set_64bit_val(push_wqe, 16, 0);
+		set_64bit_val(push_wqe, 24, irdma_nop_hdr(qp));
+	}
+
+	return wqe;
+}
+
+__le64 *irdma_srq_get_next_recv_wqe(struct irdma_srq_uk *srq, __u32 *wqe_idx)
+{
+	int ret_code;
+	__le64 *wqe;
+
+	if (IRDMA_RING_FULL_ERR(srq->srq_ring))
+		return NULL;
+
+	IRDMA_ATOMIC_RING_MOVE_HEAD(srq->srq_ring, *wqe_idx, ret_code);
+	if (ret_code)
+		return NULL;
+
+	if (!*wqe_idx)
+		srq->srwqe_polarity = !srq->srwqe_polarity;
+	wqe = srq->srq_base[*wqe_idx * srq->wqe_size_multiplier].elem;
 
 	return wqe;
 }
@@ -257,7 +369,7 @@ int irdma_uk_rdma_write(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	bool read_fence = false;
 	__u16 quanta;
 
-	info->push_wqe = qp->push_db ? true : false;
+	info->push_wqe = false;
 
 	op_info = &info->op.rdma_write;
 	if (op_info->num_lo_sges > qp->max_sq_frag_cnt)
@@ -277,12 +389,12 @@ int irdma_uk_rdma_write(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	if (ret_code)
 		return ret_code;
 
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, quanta, total_size,
-					 info);
+	if (qp->push_db)
+		info->push_wqe = irdma_enable_push_wqe(qp, total_size);
+
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMAQPSQ_FRAG_TO, op_info->rem_addr.addr));
@@ -328,16 +440,173 @@ int irdma_uk_rdma_write(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
 
+/**
+ * irdma_uk_atomic_fetch_add - atomic fetch and add operation
+ * @qp: hw qp ptr
+ * @info: post sq information
+ * @post_sq: flag to post sq
+ */
+int irdma_uk_atomic_fetch_add(struct irdma_qp_uk *qp,
+			      struct irdma_post_sq_info *info, bool post_sq)
+{
+	struct irdma_atomic_fetch_add *op_info;
+	__u32 total_size = 0;
+	__u16 quanta = 2;
+	__u32 wqe_idx;
+	__le64 *wqe;
+	__u64 hdr;
+
+	info->push_wqe = qp->push_db ? true : false;
+
+	op_info = &info->op.atomic_fetch_add;
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
+	if (!wqe)
+		return ENOMEM;
+
+	set_64bit_val(wqe, 0, op_info->tagged_offset);
+	set_64bit_val(wqe, 8,
+		      FIELD_PREP(IRDMAQPSQ_LOCSTAG, op_info->stag));
+	set_64bit_val(wqe, 16, op_info->remote_tagged_offset);
+
+	hdr = FIELD_PREP(IRDMAQPSQ_ADDFRAGCNT, 1) |
+	      FIELD_PREP(IRDMAQPSQ_REMSTAG, op_info->remote_stag) |
+	      FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_ATOMIC_FETCH_ADD) |
+	      FIELD_PREP(IRDMAQPSQ_PUSHWQE, info->push_wqe) |
+	      FIELD_PREP(IRDMAQPSQ_READFENCE, info->read_fence) |
+	      FIELD_PREP(IRDMAQPSQ_LOCALFENCE, info->local_fence) |
+	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, info->signaled) |
+	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
+
+	set_64bit_val(wqe, 32, op_info->fetch_add_data_bytes);
+	set_64bit_val(wqe, 40, 0);
+	set_64bit_val(wqe, 48, 0);
+	set_64bit_val(wqe, 56,
+		      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity));
+
+	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
+
+	set_64bit_val(wqe, 24, hdr);
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
+
+	return 0;
+}
+
+/**
+ * irdma_uk_atomic_compare_swap - atomic compare and swap operation
+ * @qp: hw qp ptr
+ * @info: post sq information
+ * @post_sq: flag to post sq
+ */
+int irdma_uk_atomic_compare_swap(struct irdma_qp_uk *qp,
+				 struct irdma_post_sq_info *info, bool post_sq)
+{
+	struct irdma_atomic_compare_swap *op_info;
+	__u32 total_size = 0;
+	__u16 quanta = 2;
+	__u32 wqe_idx;
+	__le64 *wqe;
+	__u64 hdr;
+
+	info->push_wqe = qp->push_db ? true : false;
+
+	op_info = &info->op.atomic_compare_swap;
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
+	if (!wqe)
+		return ENOMEM;
+
+	set_64bit_val(wqe, 0, op_info->tagged_offset);
+	set_64bit_val(wqe, 8,
+		      FIELD_PREP(IRDMAQPSQ_LOCSTAG, op_info->stag));
+	set_64bit_val(wqe, 16, op_info->remote_tagged_offset);
+
+	hdr = FIELD_PREP(IRDMAQPSQ_ADDFRAGCNT, 1) |
+	      FIELD_PREP(IRDMAQPSQ_REMSTAG, op_info->remote_stag) |
+	      FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_ATOMIC_COMPARE_SWAP_ADD) |
+	      FIELD_PREP(IRDMAQPSQ_PUSHWQE, info->push_wqe) |
+	      FIELD_PREP(IRDMAQPSQ_READFENCE, info->read_fence) |
+	      FIELD_PREP(IRDMAQPSQ_LOCALFENCE, info->local_fence) |
+	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, info->signaled) |
+	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
+
+	set_64bit_val(wqe, 32, op_info->swap_data_bytes);
+	set_64bit_val(wqe, 40, op_info->compare_data_bytes);
+	set_64bit_val(wqe, 48, 0);
+	set_64bit_val(wqe, 56,
+		      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity));
+
+	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
+
+	set_64bit_val(wqe, 24, hdr);
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
+
+	return 0;
+}
+
+/**
+ * irdma_uk_srq_post_receive - post a receive wqe to a shared rq
+ * @srq: shared rq ptr
+ * @info: post rq information
+ */
+int irdma_uk_srq_post_receive(struct irdma_srq_uk *srq,
+			      struct irdma_post_rq_info *info)
+{
+	__u32 wqe_idx, i, byte_off;
+	__u32 addl_frag_cnt;
+	__le64 *wqe;
+	__u64 hdr;
+
+	if (srq->max_srq_frag_cnt < info->num_sges)
+		return EINVAL;
+
+	wqe = irdma_srq_get_next_recv_wqe(srq, &wqe_idx);
+	if (!wqe)
+		return ENOMEM;
+
+	addl_frag_cnt = info->num_sges > 1 ? info->num_sges - 1 : 0;
+	srq->wqe_ops.iw_set_fragment(wqe, 0, info->sg_list,
+				     srq->srwqe_polarity);
+
+	for (i = 1, byte_off = 32; i < info->num_sges; i++) {
+		srq->wqe_ops.iw_set_fragment(wqe, byte_off, &info->sg_list[i],
+					     srq->srwqe_polarity);
+		byte_off += 16;
+	}
+
+	/* if not an odd number set valid bit in next fragment */
+	if (srq->uk_attrs->hw_rev >= IRDMA_GEN_2 && !(info->num_sges & 0x01) &&
+	    info->num_sges) {
+		srq->wqe_ops.iw_set_fragment(wqe, byte_off, NULL,
+					     srq->srwqe_polarity);
+		if (srq->uk_attrs->hw_rev == IRDMA_GEN_2)
+			++addl_frag_cnt;
+	}
+
+	set_64bit_val(wqe, 16, (__u64)info->wr_id);
+	hdr = FIELD_PREP(IRDMAQPSQ_ADDFRAGCNT, addl_frag_cnt) |
+	      FIELD_PREP(IRDMAQPSQ_VALID, srq->srwqe_polarity);
+
+	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
+
+	set_64bit_val(wqe, 24, hdr);
+
+	set_64bit_val(srq->shadow_area, 0, (wqe_idx + 1) % srq->srq_ring.size);
+
+	return 0;
+}
 /**
  * irdma_uk_rdma_read - rdma read command
  * @qp: hw qp ptr
@@ -352,13 +621,14 @@ int irdma_uk_rdma_read(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	int ret_code;
 	__u32 i, byte_off, total_size = 0;
 	bool local_fence = false;
+	bool ord_fence = false;
 	__u32 addl_frag_cnt;
 	__le64 *wqe;
 	__u32 wqe_idx;
 	__u16 quanta;
 	__u64 hdr;
 
-	info->push_wqe = qp->push_db ? true : false;
+	info->push_wqe &= qp->push_db ? true : false;
 
 	op_info = &info->op.rdma_read;
 	if (qp->max_sq_frag_cnt < op_info->num_lo_sges)
@@ -371,12 +641,14 @@ int irdma_uk_rdma_read(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	if (ret_code)
 		return ret_code;
 
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, quanta, total_size,
-					 info);
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
 
-	irdma_clr_wqes(qp, wqe_idx);
+	if (qp->rd_fence_rate && (qp->ord_cnt++ == qp->rd_fence_rate)) {
+		ord_fence = true;
+		qp->ord_cnt = 0;
+	}
 
 	addl_frag_cnt = op_info->num_lo_sges > 1 ?
 			(op_info->num_lo_sges - 1) : 0;
@@ -407,7 +679,8 @@ int irdma_uk_rdma_read(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	      FIELD_PREP(IRDMAQPSQ_OPCODE,
 			 (inv_stag ? IRDMAQP_OP_RDMA_READ_LOC_INV : IRDMAQP_OP_RDMA_READ)) |
 	      FIELD_PREP(IRDMAQPSQ_PUSHWQE, info->push_wqe) |
-	      FIELD_PREP(IRDMAQPSQ_READFENCE, info->read_fence) |
+	      FIELD_PREP(IRDMAQPSQ_READFENCE,
+			 info->read_fence || ord_fence ? 1 : 0) |
 	      FIELD_PREP(IRDMAQPSQ_LOCALFENCE, local_fence) |
 	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, info->signaled) |
 	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
@@ -415,12 +688,10 @@ int irdma_uk_rdma_read(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -443,7 +714,7 @@ int irdma_uk_send(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	bool read_fence = false;
 	__u16 quanta;
 
-	info->push_wqe = qp->push_db ? true : false;
+	info->push_wqe = false;
 
 	op_info = &info->op.send;
 	if (qp->max_sq_frag_cnt < op_info->num_sges)
@@ -460,12 +731,12 @@ int irdma_uk_send(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	if (ret_code)
 		return ret_code;
 
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, quanta, total_size,
-					 info);
+	if (qp->push_db)
+		info->push_wqe = irdma_enable_push_wqe(qp, total_size);
+
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	read_fence |= info->read_fence;
 	addl_frag_cnt = frag_cnt > 1 ? (frag_cnt - 1) : 0;
@@ -516,12 +787,10 @@ int irdma_uk_send(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -569,7 +838,7 @@ static void irdma_copy_inline_data_gen_1(__u8 *wqe, struct ibv_sge *sge_list,
 			sge_len -= bytes_copied;
 
 			if (!quanta_bytes_remaining) {
-				/* Remaining inline bytes reside after the hdr */
+				/* Remaining inline bytes reside after hdr */
 				wqe += 16;
 				quanta_bytes_remaining = 32;
 			}
@@ -637,7 +906,7 @@ static void irdma_copy_inline_data(__u8 *wqe, struct ibv_sge *sge_list,
 			if (!quanta_bytes_remaining) {
 				quanta_bytes_remaining = 31;
 
-				/* Remaining inline bytes reside after the hdr */
+				/* Remaining inline bytes reside after hdr */
 				if (first_quanta) {
 					first_quanta = false;
 					wqe += 16;
@@ -692,8 +961,8 @@ int irdma_uk_inline_rdma_write(struct irdma_qp_uk *qp,
 	__u64 hdr = 0;
 	__u32 wqe_idx;
 	bool read_fence = false;
-	__u32 i, total_size = 0;
 	__u16 quanta;
+	__u32 i, total_size = 0;
 
 	info->push_wqe = qp->push_db ? true : false;
 	op_info = &info->op.rdma_write;
@@ -708,12 +977,10 @@ int irdma_uk_inline_rdma_write(struct irdma_qp_uk *qp,
 		return EINVAL;
 
 	quanta = qp->wqe_ops.iw_inline_data_size_to_quanta(total_size);
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, quanta, total_size,
-					 info);
+
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	read_fence |= info->read_fence;
 	set_64bit_val(wqe, 16,
@@ -737,16 +1004,15 @@ int irdma_uk_inline_rdma_write(struct irdma_qp_uk *qp,
 
 	qp->wqe_ops.iw_copy_inline_data((__u8 *)wqe, op_info->lo_sg_list,
 					op_info->num_lo_sges, qp->swqe_polarity);
+
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
 
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -765,8 +1031,8 @@ int irdma_uk_inline_send(struct irdma_qp_uk *qp,
 	__u64 hdr;
 	__u32 wqe_idx;
 	bool read_fence = false;
-	__u32 i, total_size = 0;
 	__u16 quanta;
+	__u32 i, total_size = 0;
 
 	info->push_wqe = qp->push_db ? true : false;
 	op_info = &info->op.send;
@@ -781,12 +1047,9 @@ int irdma_uk_inline_send(struct irdma_qp_uk *qp,
 		return EINVAL;
 
 	quanta = qp->wqe_ops.iw_inline_data_size_to_quanta(total_size);
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, quanta, total_size,
-					 info);
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, total_size, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMAQPSQ_DESTQKEY, op_info->qkey) |
@@ -819,12 +1082,10 @@ int irdma_uk_inline_send(struct irdma_qp_uk *qp,
 
 	set_64bit_val(wqe, 24, hdr);
 
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -845,17 +1106,15 @@ int irdma_uk_stag_local_invalidate(struct irdma_qp_uk *qp,
 	__u32 wqe_idx;
 	bool local_fence = false;
 	struct ibv_sge sge = {};
+	__u16 quanta = IRDMA_QP_WQE_MIN_QUANTA;
 
 	info->push_wqe = qp->push_db ? true : false;
 	op_info = &info->op.inv_local_stag;
 	local_fence = info->local_fence;
 
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, IRDMA_QP_WQE_MIN_QUANTA,
-					 0, info);
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, 0, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	sge.lkey = op_info->target_stag;
 	qp->wqe_ops.iw_set_fragment(wqe, 0, &sge, 0);
@@ -873,13 +1132,10 @@ int irdma_uk_stag_local_invalidate(struct irdma_qp_uk *qp,
 
 	set_64bit_val(wqe, 24, hdr);
 
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, IRDMA_QP_WQE_MIN_QUANTA, wqe_idx,
-				  post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -897,18 +1153,16 @@ int irdma_uk_mw_bind(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	struct irdma_bind_window *op_info;
 	__u64 hdr;
 	__u32 wqe_idx;
-	bool local_fence = false;
+	bool local_fence;
+	__u16 quanta = IRDMA_QP_WQE_MIN_QUANTA;
 
 	info->push_wqe = qp->push_db ? true : false;
 	op_info = &info->op.bind_window;
-	local_fence |= info->local_fence;
+	local_fence = info->local_fence;
 
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, IRDMA_QP_WQE_MIN_QUANTA,
-					 0, info);
+	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, &quanta, 0, info);
 	if (!wqe)
 		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
 
 	qp->wqe_ops.iw_set_mw_bind_wqe(wqe, op_info);
 
@@ -923,19 +1177,17 @@ int irdma_uk_mw_bind(struct irdma_qp_uk *qp, struct irdma_post_sq_info *info,
 	      FIELD_PREP(IRDMAQPSQ_READFENCE, info->read_fence) |
 	      FIELD_PREP(IRDMAQPSQ_LOCALFENCE, local_fence) |
 	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, info->signaled) |
+	      FIELD_PREP(IRDMAQPSQ_REMOTE_ATOMICS_EN, op_info->remote_atomics_en) |
 	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
 
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
 
-	if (info->push_wqe) {
-		irdma_qp_push_wqe(qp, wqe, IRDMA_QP_WQE_MIN_QUANTA, wqe_idx,
-				  post_sq);
-	} else {
-		if (post_sq)
-			irdma_uk_qp_post_wr(qp);
-	}
+	if (qp->push_db)
+		irdma_qp_push_wqe(qp, wqe, quanta, wqe_idx, info->push_wqe);
+	else if (post_sq)
+		irdma_uk_qp_post_wr(qp);
 
 	return 0;
 }
@@ -1066,7 +1318,41 @@ void irdma_uk_cq_request_notification(struct irdma_cq_uk *cq,
 
 	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
 
-	db_wr32(cq->cq_id, cq->cqe_alloc_db);
+	mmio_write32(cq->cqe_alloc_db, cq->cq_id);
+}
+
+static int irdma_check_sq_cqe(struct irdma_qp_uk *qp, __u32 *wqe_idx)
+{
+	__u32 tail = IRDMA_RING_CURRENT_TAIL(qp->sq_sig_ring);
+
+	if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE) {
+		atomic_fetch_sub(&qp->sq_ring.post_cnt, qp->sq_sigwrtrk_array[tail].post_cnt);
+		qp->sq_sigwrtrk_array[tail].post_cnt = 0;
+	}
+	IRDMA_RING_MOVE_TAIL(qp->sq_sig_ring);
+
+	return 0;
+}
+
+/**
+ * irdma_uk_cq_empty - Check if CQ is empty
+ * @cq: hw cq
+ */
+bool irdma_uk_cq_empty(struct irdma_cq_uk *cq)
+{
+	__le64 *cqe;
+	__u8 polarity;
+	__u64 qword3;
+
+	if (cq->avoid_mem_cflct)
+		cqe = IRDMA_GET_CURRENT_EXTENDED_CQ_ELEM(cq);
+	else
+		cqe = IRDMA_GET_CURRENT_CQ_ELEM(cq);
+
+	get_64bit_val(cqe, 24, &qword3);
+	polarity = (__u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
+
+	return polarity != cq->polarity;
 }
 
 /**
@@ -1080,6 +1366,9 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	__u64 comp_ctx, qword0, qword2, qword3;
 	__le64 *cqe;
 	struct irdma_qp_uk *qp;
+	struct irdma_srq_uk *srq;
+	struct qp_err_code qp_err;
+	__u8 is_srq;
 	struct irdma_ring *pring = NULL;
 	__u32 wqe_idx;
 	int ret_code;
@@ -1153,22 +1442,52 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	}
 
 	info->q_type = (__u8)FIELD_GET(IRDMA_CQ_SQ, qword3);
+	is_srq = (__u8)FIELD_GET(IRDMA_CQ_SRQ, qword3);
 	info->error = (bool)FIELD_GET(IRDMA_CQ_ERROR, qword3);
 	info->push_dropped = (bool)FIELD_GET(IRDMACQ_PSHDROP, qword3);
 	info->ipv4 = (bool)FIELD_GET(IRDMACQ_IPV4, qword3);
+	get_64bit_val(cqe, 8, &comp_ctx);
+	if (is_srq)
+		get_64bit_val(cqe, 40, (__u64 *)&qp);
+	else
+		qp = (struct irdma_qp_uk *)(uintptr_t)comp_ctx;
+	if (!qp || qp->destroy_pending) {
+		ret_code = EFAULT;
+		goto exit;
+	}
 	if (info->error) {
 		info->major_err = FIELD_GET(IRDMA_CQ_MAJERR, qword3);
 		info->minor_err = FIELD_GET(IRDMA_CQ_MINERR, qword3);
-		if (info->major_err == IRDMA_FLUSH_MAJOR_ERR) {
-			info->comp_status = IRDMA_COMPL_STATUS_FLUSHED;
+		switch (info->major_err) {
+		case IRDMA_SRQFLUSH_RSVD_MAJOR_ERR:
+			qp_err = irdma_ae_to_qp_err_code(info->minor_err);
+			info->minor_err = qp_err.flush_code;
+			SWITCH_FALLTHROUGH;
+		case IRDMA_FLUSH_MAJOR_ERR:
 			/* Set the min error to standard flush error code for remaining cqes */
 			if (info->minor_err != FLUSH_GENERAL_ERR) {
 				qword3 &= ~IRDMA_CQ_MINERR;
 				qword3 |= FIELD_PREP(IRDMA_CQ_MINERR, FLUSH_GENERAL_ERR);
 				set_64bit_val(cqe, 24, qword3);
 			}
-		} else {
-			info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
+			info->comp_status = IRDMA_COMPL_STATUS_FLUSHED;
+			break;
+		default:
+#define IRDMA_CIE_SIGNATURE 0xE
+#define IRDMA_CQMAJERR_HIGH_NIBBLE_S 12
+#define IRDMA_CQMAJERR_HIGH_NIBBLE GENMASK(15, 12)
+			if (info->q_type == IRDMA_CQE_QTYPE_SQ
+			    && qp->qp_type == IRDMA_QP_TYPE_ROCE_UD
+			    && FIELD_GET(IRDMA_CQMAJERR_HIGH_NIBBLE, info->major_err)
+			    == IRDMA_CIE_SIGNATURE) {
+				info->error = 0;
+				info->major_err = 0;
+				info->minor_err = 0;
+				info->comp_status = IRDMA_COMPL_STATUS_SUCCESS;
+			} else {
+				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
+			}
+			break;
 		}
 	} else {
 		info->comp_status = IRDMA_COMPL_STATUS_SUCCESS;
@@ -1177,40 +1496,19 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	get_64bit_val(cqe, 0, &qword0);
 	get_64bit_val(cqe, 16, &qword2);
 
-	info->tcp_seq_num_rtt = (__u32)FIELD_GET(IRDMACQ_TCPSEQNUMRTT, qword0);
+	info->stat.raw = (__u32)FIELD_GET(IRDMACQ_TCPSQN_ROCEPSN_RTT_TS, qword0);
 	info->qp_id = (__u32)FIELD_GET(IRDMACQ_QPID, qword2);
 	info->ud_src_qpn = (__u32)FIELD_GET(IRDMACQ_UDSRCQPN, qword2);
 
-	get_64bit_val(cqe, 8, &comp_ctx);
-
 	info->solicited_event = (bool)FIELD_GET(IRDMACQ_SOEVENT, qword3);
-	qp = (struct irdma_qp_uk *)(uintptr_t)comp_ctx;
-	if (!qp || qp->destroy_pending) {
-		ret_code = EFAULT;
-		goto exit;
-	}
 	wqe_idx = (__u32)FIELD_GET(IRDMA_CQ_WQEIDX, qword3);
 	info->qp_handle = (irdma_qp_handle)(uintptr_t)qp;
 	info->op_type = (__u8)FIELD_GET(IRDMACQ_OP, qword3);
 
-	if (info->q_type == IRDMA_CQE_QTYPE_RQ) {
-		__u32 array_idx;
+	if (info->q_type == IRDMA_CQE_QTYPE_RQ && is_srq) {
+		srq = qp->srq_uk;
 
-		array_idx = wqe_idx / qp->rq_wqe_size_multiplier;
-
-		if (info->comp_status == IRDMA_COMPL_STATUS_FLUSHED ||
-		    info->comp_status == IRDMA_COMPL_STATUS_UNKNOWN) {
-			if (!IRDMA_RING_MORE_WORK(qp->rq_ring)) {
-				ret_code = ENOENT;
-				goto exit;
-			}
-
-			info->wr_id = qp->rq_wrid_array[qp->rq_ring.tail];
-			array_idx = qp->rq_ring.tail;
-		} else {
-			info->wr_id = qp->rq_wrid_array[array_idx];
-		}
-
+		get_64bit_val(cqe, 8, &info->wr_id);
 		info->bytes_xfered = (__u32)FIELD_GET(IRDMACQ_PAYLDLEN, qword0);
 
 		if (qword3 & IRDMACQ_STAG) {
@@ -1219,13 +1517,46 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		} else {
 			info->stag_invalid_set = false;
 		}
-		IRDMA_RING_SET_TAIL(qp->rq_ring, array_idx + 1);
-		if (info->comp_status == IRDMA_COMPL_STATUS_FLUSHED) {
-			qp->rq_flush_seen = true;
+		ret_code = irdma_spin_lock(srq->lock);
+		if (ret_code)
+			return ret_code;
+		IRDMA_RING_MOVE_TAIL(srq->srq_ring);
+		irdma_spin_unlock(srq->lock);
+		pring = &srq->srq_ring;
+	} else if (info->q_type == IRDMA_CQE_QTYPE_RQ && !is_srq) {
+		__u32 array_idx;
+
+		array_idx = wqe_idx / qp->rq_wqe_size_multiplier;
+		info->bytes_xfered = (__u32)FIELD_GET(IRDMACQ_PAYLDLEN, qword0);
+
+		if (qword3 & IRDMACQ_STAG) {
+			info->stag_invalid_set = true;
+			info->inv_stag = (__u32)FIELD_GET(IRDMACQ_INVSTAG, qword2);
+		} else {
+			info->stag_invalid_set = false;
+		}
+
+		if (info->comp_status == IRDMA_COMPL_STATUS_FLUSHED ||
+		    info->comp_status == IRDMA_COMPL_STATUS_UNKNOWN) {
+			ret_code = irdma_spin_lock(qp->lock);
+			if (ret_code)
+				return ret_code;
+			if (!IRDMA_RING_MORE_WORK(qp->rq_ring)) {
+				ret_code = ENOENT;
+				irdma_spin_unlock(qp->lock);
+				goto exit;
+			}
+
+			info->wr_id = qp->rq_wrid_array[qp->rq_ring.tail];
+			IRDMA_RING_SET_TAIL(qp->rq_ring, qp->rq_ring.tail + 1);
 			if (!IRDMA_RING_MORE_WORK(qp->rq_ring))
 				qp->rq_flush_complete = true;
 			else
 				move_cq_head = false;
+			irdma_spin_unlock(qp->lock);
+		} else {
+			info->wr_id = qp->rq_wrid_array[array_idx];
+			IRDMA_RING_SET_TAIL(qp->rq_ring, array_idx + 1);
 		}
 		pring = &qp->rq_ring;
 	} else { /* q_type is IRDMA_CQE_QTYPE_SQ */
@@ -1238,8 +1569,7 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 				IRDMA_RING_MOVE_TAIL(cq->cq_ring);
 				set_64bit_val(cq->shadow_area, 0,
 					      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
-				memset(info, 0,
-				       sizeof(struct irdma_cq_poll_info));
+				memset(info, 0, sizeof(*info));
 				return irdma_uk_cq_poll_cmpl(cq, info);
 			}
 		}
@@ -1252,11 +1582,27 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
 			if (!info->comp_status)
 				info->bytes_xfered = qp->sq_wrtrk_array[wqe_idx].wr_len;
+			if (!qp->sq_wrtrk_array[wqe_idx].signaled) {
+				ret_code = EFAULT;
+				goto exit;
+			}
+			if (irdma_check_sq_cqe(qp, &wqe_idx)) {
+				info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
+				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
+				info->bytes_xfered = 0;
+				IRDMA_RING_SET_TAIL(qp->sq_ring,
+						    wqe_idx + qp->sq_wrtrk_array[wqe_idx].quanta);
+				return 0;
+			}
 			info->op_type = (__u8)FIELD_GET(IRDMACQ_OP, qword3);
 			IRDMA_RING_SET_TAIL(qp->sq_ring,
 					    wqe_idx + qp->sq_wrtrk_array[wqe_idx].quanta);
 		} else {
+			ret_code = irdma_spin_lock(qp->lock);
+			if (ret_code)
+				return ret_code;
 			if (!IRDMA_RING_MORE_WORK(qp->sq_ring)) {
+				irdma_spin_unlock(qp->lock);
 				ret_code = ENOENT;
 				goto exit;
 			}
@@ -1270,7 +1616,12 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 				sw_wqe = qp->sq_base[tail].elem;
 				get_64bit_val(sw_wqe, 24,
 					      &wqe_qword);
-				info->op_type = (__u8)FIELD_GET(IRDMAQPSQ_OPCODE, wqe_qword);
+				info->op_type = (__u8)FIELD_GET(IRDMAQPSQ_OPCODE,
+							      wqe_qword);
+				if (qp->uk_attrs->feature_flags & IRDMA_FEATURE_ENFORCE_SQ_SIZE)
+					atomic_fetch_sub(
+						&qp->sq_ring.post_cnt,
+						qp->sq_sigwrtrk_array[tail].post_cnt);
 				IRDMA_RING_SET_TAIL(qp->sq_ring,
 						    tail + qp->sq_wrtrk_array[tail].quanta);
 				if (info->op_type != IRDMAQP_OP_NOP) {
@@ -1279,9 +1630,13 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 					break;
 				}
 			} while (1);
-			qp->sq_flush_seen = true;
+
+			if (info->op_type == IRDMA_OP_TYPE_BIND_MW &&
+			    info->minor_err == FLUSH_PROT_ERR)
+				info->minor_err = FLUSH_MW_BIND_ERR;
 			if (!IRDMA_RING_MORE_WORK(qp->sq_ring))
 				qp->sq_flush_complete = true;
+			irdma_spin_unlock(qp->lock);
 		}
 		pring = &qp->sq_ring;
 	}
@@ -1289,9 +1644,15 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	ret_code = 0;
 
 exit:
-	if (!ret_code && info->comp_status == IRDMA_COMPL_STATUS_FLUSHED)
+	if (!ret_code && info->comp_status == IRDMA_COMPL_STATUS_FLUSHED) {
 		if (pring && IRDMA_RING_MORE_WORK(*pring))
-			move_cq_head = false;
+			/* Park CQ head during a flush to generate additional CQEs
+			 * from SW for all unprocessed WQEs. For GEN3 and beyond
+			 * FW will generate/flush these CQEs so move to the next CQE
+			 */
+			move_cq_head = qp->uk_attrs->hw_rev <= IRDMA_GEN_2 ?
+						false : true;
+	}
 
 	if (move_cq_head) {
 		IRDMA_RING_MOVE_HEAD_NOCHECK(cq->cq_ring);
@@ -1307,8 +1668,9 @@ exit:
 		IRDMA_RING_MOVE_TAIL(cq->cq_ring);
 		if (!cq->avoid_mem_cflct && ext_valid)
 			IRDMA_RING_MOVE_TAIL(cq->cq_ring);
-		set_64bit_val(cq->shadow_area, 0,
-			      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
+		if (IRDMA_RING_CURRENT_HEAD(cq->cq_ring) & 0x3F || irdma_uk_cq_empty(cq))
+			set_64bit_val(cq->shadow_area, 0,
+				      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
 	} else {
 		qword3 &= ~IRDMA_CQ_WQEIDX;
 		qword3 |= FIELD_PREP(IRDMA_CQ_WQEIDX, pring->tail);
@@ -1319,10 +1681,219 @@ exit:
 }
 
 /**
- * irdma_qp_round_up - return round up qp wq depth
+ * irdma_print_cqes - print cq completion info
+ * @cq: hw cq
+ */
+void irdma_print_cqes(struct irdma_cq_uk *cq)
+{
+	__u8 cq_polarity = cq->polarity;
+	int i = 0;
+
+	fprintf(stderr, "%s[%d]: CQ (cq_id=%u, polarity=%d, head=%u, size=%u)\n",
+		      __func__, __LINE__, cq->cq_id, cq_polarity,
+		      cq->cq_ring.head, cq->cq_ring.size);
+
+	while (true) {
+		__u64 comp_ctx, qword0, qword2, qword3;
+		struct irdma_cq_poll_info cqe_info;
+		struct irdma_cq_poll_info *info = &cqe_info;
+		struct irdma_qp_uk *qp;
+		__le64 *ext_cqe = NULL;
+		bool ext_valid;
+		__u8 polarity;
+		__u32 wqe_idx;
+		__le64 *cqe;
+
+		IRDMA_GET_CQ_ELEM_AT_OFFSET(cq, i, cqe);
+		get_64bit_val(cqe, 24, &qword3);
+		polarity = (__u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
+
+		if (polarity != cq_polarity) {
+			fprintf(stderr, "%s[%d]: CQ (cq_id=%u) is empty\n",
+				      __func__, __LINE__, cq->cq_id);
+			return;
+		}
+
+		/* Ensure CQE contents are read after valid bit is checked */
+		udma_from_device_barrier();
+
+		ext_valid = (bool)FIELD_GET(IRDMA_CQ_EXTCQE, qword3);
+		if (ext_valid) {
+			__u64 qword7;
+			__u32 peek_head;
+
+			if (cq->avoid_mem_cflct) {
+				ext_cqe = (__le64 *)((__u8 *)cqe + 32);
+				get_64bit_val(ext_cqe, 24, &qword7);
+				polarity = (__u8)FIELD_GET(IRDMA_CQ_VALID, qword7);
+			} else {
+				peek_head = IRDMA_GET_RING_OFFSET(cq->cq_ring, i + 1);
+				ext_cqe = cq->cq_base[peek_head].buf;
+				get_64bit_val(ext_cqe, 24, &qword7);
+				polarity = (__u8)FIELD_GET(IRDMA_CQ_VALID, qword7);
+				if (!peek_head)
+					polarity ^= 1;
+			}
+			if (polarity != cq_polarity) {
+				fprintf(stderr, "%s[%d]: Extended CQ (cq_id=%u) is empty\n",
+					      __func__, __LINE__, cq->cq_id);
+				return;
+			}
+
+			/* Ensure ext CQE contents are read after ext valid bit is checked */
+			udma_from_device_barrier();
+
+			memset(info, 0, sizeof(*info));
+			info->imm_valid = (bool)FIELD_GET(IRDMA_CQ_IMMVALID, qword7);
+			if (info->imm_valid) {
+				__u64 qword4;
+
+				get_64bit_val(ext_cqe, 0, &qword4);
+				info->imm_data = (__u32)FIELD_GET(IRDMA_CQ_IMMDATALOW32, qword4);
+			}
+		} else {
+			info->imm_valid = false;
+		}
+
+		info->q_type = (__u8)FIELD_GET(IRDMA_CQ_SQ, qword3);
+		info->error = (bool)FIELD_GET(IRDMA_CQ_ERROR, qword3);
+		info->push_dropped = (bool)FIELD_GET(IRDMACQ_PSHDROP, qword3);
+		info->ipv4 = (bool)FIELD_GET(IRDMACQ_IPV4, qword3);
+		if (info->error) {
+			info->major_err = FIELD_GET(IRDMA_CQ_MAJERR, qword3);
+			info->minor_err = FIELD_GET(IRDMA_CQ_MINERR, qword3);
+			if (info->major_err == IRDMA_FLUSH_MAJOR_ERR)
+				info->comp_status = IRDMA_COMPL_STATUS_FLUSHED;
+			else
+				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
+		} else {
+			info->comp_status = IRDMA_COMPL_STATUS_SUCCESS;
+			info->major_err = 0;
+			info->minor_err = 0;
+		}
+
+		get_64bit_val(cqe, 0, &qword0);
+		get_64bit_val(cqe, 16, &qword2);
+
+		info->qp_id = (__u32)FIELD_GET(IRDMACQ_QPID, qword2);
+		get_64bit_val(cqe, 8, &comp_ctx);
+		info->solicited_event = (bool)FIELD_GET(IRDMACQ_SOEVENT, qword3);
+
+		fprintf(stderr, "%s[%d]: Found CQE (cq_id=%u major_err=%u minor_err=%u q_type=%u "
+			      "push_dropped=%s ipv4=%s solicited_event=%s imm_data=%u qp_id=%u)\n",
+			      __func__, __LINE__, cq->cq_id, info->major_err, info->minor_err,
+			      info->q_type, info->push_dropped ? "true" : "false",
+			      info->ipv4 ? "true" : "false",
+			      info->solicited_event ? "true" : "false",
+			      info->imm_valid ? info->imm_data : 0, info->qp_id);
+
+		qp = (struct irdma_qp_uk *)(uintptr_t)comp_ctx;
+		if (!qp || qp->destroy_pending) {
+			fprintf(stderr, "%s[%d]: Found CQE for (cq_id=%u qp_id=%u): QP destroyed\n",
+				      __func__, __LINE__, cq->cq_id, info->qp_id);
+			goto loop_end;
+		}
+		wqe_idx = (__u32)FIELD_GET(IRDMA_CQ_WQEIDX, qword3);
+		info->qp_handle = (irdma_qp_handle)(uintptr_t)qp;
+		info->op_type = (__u8)FIELD_GET(IRDMACQ_OP, qword3);
+
+		if (info->q_type == IRDMA_CQE_QTYPE_RQ) {
+			__u32 array_idx;
+
+			array_idx = wqe_idx / qp->rq_wqe_size_multiplier;
+			info->wr_id = qp->rq_wrid_array[array_idx];
+
+			if (qword3 & IRDMACQ_STAG) {
+				info->stag_invalid_set = true;
+				info->inv_stag = (__u32)FIELD_GET(IRDMACQ_INVSTAG, qword2);
+			} else {
+				info->stag_invalid_set = false;
+			}
+
+			fprintf(stderr, "%s[%d]: Found CQE for RQ qp_id=%u rq_ring (head=%u tail=%u size=%u) "
+				      "wr_id=%llu wqe_idx=%u, stag_invalid_set=%s op_type=%u\n",
+				      __func__, __LINE__, info->qp_id, qp->rq_ring.head, qp->rq_ring.tail,
+				      qp->rq_ring.size, info->wr_id, wqe_idx,
+				      info->stag_invalid_set ? "true" : "false", info->op_type);
+
+		} else { /* q_type is IRDMA_CQE_QTYPE_SQ */
+
+			if (qp->first_sq_wq) {
+				fprintf(stderr, "%s[%d]: Found CQE for SQ first_sq_wq (qp_id=%u, wqe_idx=%u, conn_wqes=%d)\n",
+					      __func__, __LINE__, info->qp_id, wqe_idx, qp->conn_wqes);
+
+				if (wqe_idx < qp->conn_wqes && qp->sq_ring.head == qp->sq_ring.tail)
+					goto loop_end;
+			}
+
+			info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
+			info->op_type = (__u8)FIELD_GET(IRDMACQ_OP, qword3);
+
+			fprintf(stderr, "%s[%d]: Found CQE for SQ qp_id=%u, sq_ring (head=%u tail=%u size=%u) "
+				      "wr_id=%llu wqe_idx=%u op_type=%u\n",
+				      __func__, __LINE__, info->qp_id, qp->sq_ring.head, qp->sq_ring.tail,
+				      qp->sq_ring.size, info->wr_id, wqe_idx, info->op_type);
+		}
+loop_end:
+			i++;
+			if (!IRDMA_GET_RING_OFFSET(cq->cq_ring, i))
+				cq_polarity ^= 1;
+
+			if (ext_valid && !cq->avoid_mem_cflct) {
+				i++;
+				if (!IRDMA_GET_RING_OFFSET(cq->cq_ring, i))
+					cq_polarity ^= 1;
+			}
+	}
+}
+
+/**
+ * irdma_print_sq_wqes - print sqp wqes
+ * @qp: hw qp
+ */
+void irdma_print_sq_wqes(struct irdma_qp_uk *qp)
+{
+	__u32 wqe_idx = IRDMA_RING_CURRENT_TAIL(qp->sq_ring);
+	__u8 sq_polarity = qp->swqe_polarity;
+
+	fprintf(stderr, "%s[%d]: SQ (qp_id=%u sq_polarity=%d head=%u tail=%u size=%u)\n",
+		      __func__, __LINE__, qp->qp_id, sq_polarity,
+		      qp->sq_ring.head, qp->sq_ring.tail, qp->sq_ring.size);
+
+	if (!IRDMA_RING_MORE_WORK(qp->sq_ring)) {
+		fprintf(stderr, "%s[%d]: SQ is empty (qp_id=%u)\n", __func__, __LINE__, qp->qp_id);
+		return;
+	}
+
+	while (true) {
+		__u8 wqe_polarity;
+		__le64 *wqe;
+		__u64 val;
+
+		wqe = qp->sq_base[wqe_idx].elem;
+		get_64bit_val(wqe, 24, &val);
+		wqe_polarity = FIELD_GET(IRDMAQPSQ_VALID, val);
+
+		if (wqe_polarity != sq_polarity)
+			break;
+
+		fprintf(stderr, "%s[%d]: Found WQE in SQ qp_id=%u wr_id=%llu wqe_idx=%u "
+			      "wr_len=%u quanta=%u hdr=0x%0llX\n",
+			      __func__, __LINE__, qp->qp_id, qp->sq_wrtrk_array[wqe_idx].wrid, wqe_idx,
+			      qp->sq_wrtrk_array[wqe_idx].wr_len, qp->sq_wrtrk_array[wqe_idx].quanta, val);
+
+		wqe_idx += qp->sq_wrtrk_array[wqe_idx].quanta;
+
+		if (!wqe_idx)
+			sq_polarity = !qp->swqe_polarity;
+	}
+}
+
+/**
+ * irdma_round_up_wq - return round up qp wq depth
  * @wqdepth: wq depth in quanta to round up
  */
-static int irdma_qp_round_up(__u32 wqdepth)
+static __u64 irdma_round_up_wq(__u64 wqdepth)
 {
 	int scount = 1;
 
@@ -1370,42 +1941,63 @@ void irdma_get_wqe_shift(struct irdma_uk_attrs *uk_attrs, __u32 sge,
  * @sq_size: SQ size
  * @shift: shift which determines size of WQE
  * @sqdepth: depth of SQ
- *
  */
-int irdma_get_sqdepth(struct irdma_uk_attrs *uk_attrs,
-		      __u32 sq_size, __u8 shift, __u32 *sqdepth)
+int irdma_get_sqdepth(struct irdma_uk_attrs *uk_attrs, __u32 sq_size, __u8 shift, __u32 *sqdepth)
 {
-	__u32 min_size = (__u32)uk_attrs->min_hw_wq_size << shift;
+	__u32 min_hw_quanta = (__u32)uk_attrs->min_hw_wq_size << shift;
+	__u64 hw_quanta =
+		irdma_round_up_wq(((__u64)sq_size << shift) + IRDMA_SQ_RSVD);
 
-	*sqdepth = irdma_qp_round_up((sq_size << shift) + IRDMA_SQ_RSVD);
-
-	if (*sqdepth < min_size)
-		*sqdepth = min_size;
-	else if (*sqdepth > uk_attrs->max_hw_wq_quanta)
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_wq_quanta)
 		return EINVAL;
 
+	*sqdepth = hw_quanta;
 	return 0;
 }
 
 /*
  * irdma_get_rqdepth - get RQ depth (quanta)
  * @uk_attrs: qp HW attributes
- * @rq_size: RQ size
+ * @rq_size: SRQ size
  * @shift: shift which determines size of WQE
- * @rqdepth: depth of RQ
+ * @rqdepth: depth of RQ/SRQ
  */
-int irdma_get_rqdepth(struct irdma_uk_attrs *uk_attrs,
-		      __u32 rq_size, __u8 shift, __u32 *rqdepth)
+int irdma_get_rqdepth(struct irdma_uk_attrs *uk_attrs, __u32 rq_size, __u8 shift, __u32 *rqdepth)
 {
-	__u32 min_size = (__u32)uk_attrs->min_hw_wq_size << shift;
+	__u32 min_hw_quanta = (__u32)uk_attrs->min_hw_wq_size << shift;
+	__u64 hw_quanta =
+		irdma_round_up_wq(((__u64)rq_size << shift) + IRDMA_RQ_RSVD);
 
-	*rqdepth = irdma_qp_round_up((rq_size << shift) + IRDMA_RQ_RSVD);
-
-	if (*rqdepth < min_size)
-		*rqdepth = min_size;
-	else if (*rqdepth > uk_attrs->max_hw_rq_quanta)
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_rq_quanta)
 		return EINVAL;
 
+	*rqdepth = hw_quanta;
+	return 0;
+}
+
+/*
+ * irdma_get_srqdepth - get SRQ depth (quanta)
+ * @uk_attrs: qp HW attributes
+ * @srq_size: SRQ size
+ * @shift: shift which determines size of WQE
+ * @srqdepth: depth of SRQ
+ */
+int irdma_get_srqdepth(struct irdma_uk_attrs *uk_attrs, __u32 srq_size, __u8 shift, __u32 *srqdepth)
+{
+	__u32 min_hw_quanta = (__u32)uk_attrs->min_hw_wq_size << shift;
+	__u64 hw_quanta =
+		irdma_round_up_wq(((__u64)srq_size << shift) + IRDMA_RQ_RSVD);
+
+	if (hw_quanta < min_hw_quanta)
+		hw_quanta = min_hw_quanta;
+	else if (hw_quanta > uk_attrs->max_hw_srq_quanta)
+		return EINVAL;
+
+	*srqdepth = hw_quanta;
 	return 0;
 }
 
@@ -1434,14 +2026,51 @@ static void irdma_setup_connection_wqes(struct irdma_qp_uk *qp,
 {
 	__u16 move_cnt = 1;
 
-	if (!info->legacy_mode &&
-	    (qp->uk_attrs->feature_flags & IRDMA_FEATURE_RTS_AE))
+	if (info->start_wqe_idx)
+		move_cnt = info->start_wqe_idx;
+	else if (!info->legacy_mode &&
+		 (qp->uk_attrs->feature_flags & IRDMA_FEATURE_RTS_AE))
 		move_cnt = 3;
-
 	qp->conn_wqes = move_cnt;
 	IRDMA_RING_MOVE_HEAD_BY_COUNT_NOCHECK(qp->sq_ring, move_cnt);
 	IRDMA_RING_MOVE_TAIL_BY_COUNT(qp->sq_ring, move_cnt);
 	IRDMA_RING_MOVE_HEAD_BY_COUNT_NOCHECK(qp->initial_ring, move_cnt);
+}
+
+/**
+ * irdma_uk_srq_init - initialize shared qp
+ * @srq: hw srq (user and kernel)
+ * @info: srq initialization info
+ *
+ * initializes the vars used in both user and kernel mode.
+ * size of the wqe depends on numbers of max. fragements
+ * allowed. Then size of wqe * the number of wqes should be the
+ * amount of memory allocated for srq.
+ */
+int irdma_uk_srq_init(struct irdma_srq_uk *srq,
+		      struct irdma_srq_uk_init_info *info)
+{
+	__u8 rqshift;
+
+	srq->uk_attrs = info->uk_attrs;
+	if (info->max_srq_frag_cnt > srq->uk_attrs->max_hw_wq_frags)
+		return EINVAL;
+
+	irdma_get_wqe_shift(srq->uk_attrs, info->max_srq_frag_cnt, 0, &rqshift);
+	srq->srq_caps = info->srq_caps;
+	srq->srq_base = info->srq;
+	srq->shadow_area = info->shadow_area;
+	srq->srq_id = info->srq_id;
+	srq->srwqe_polarity = 0;
+	srq->srq_size = info->srq_size;
+	srq->wqe_size = rqshift;
+	srq->max_srq_frag_cnt = min(srq->uk_attrs->max_hw_wq_frags,
+				    ((__u32)2 << rqshift) - 1);
+	IRDMA_RING_INIT(srq->srq_ring, srq->srq_size);
+	srq->wqe_size_multiplier = 1 << rqshift;
+	srq->wqe_ops = iw_wqe_uk_ops;
+
+	return 0;
 }
 
 /**
@@ -1455,10 +2084,9 @@ int irdma_uk_calc_depth_shift_sq(struct irdma_qp_uk_init_info *ukinfo,
 {
 	bool imm_support = ukinfo->uk_attrs->hw_rev >= IRDMA_GEN_2 ? true : false;
 	int status;
-
 	irdma_get_wqe_shift(ukinfo->uk_attrs,
 			    imm_support ? ukinfo->max_sq_frag_cnt + 1 :
-			    ukinfo->max_sq_frag_cnt,
+					  ukinfo->max_sq_frag_cnt,
 			    ukinfo->max_inline_data, sq_shift);
 	status = irdma_get_sqdepth(ukinfo->uk_attrs, ukinfo->sq_size,
 				   *sq_shift, sq_depth);
@@ -1501,8 +2129,7 @@ int irdma_uk_calc_depth_shift_rq(struct irdma_qp_uk_init_info *ukinfo,
  * allowed. Then size of wqe * the number of wqes should be the
  * amount of memory allocated for sq and rq.
  */
-int irdma_uk_qp_init(struct irdma_qp_uk *qp,
-		     struct irdma_qp_uk_init_info *info)
+int irdma_uk_qp_init(struct irdma_qp_uk *qp, struct irdma_qp_uk_init_info *info)
 {
 	int ret_code = 0;
 	__u32 sq_ring_size;
@@ -1521,6 +2148,7 @@ int irdma_uk_qp_init(struct irdma_qp_uk *qp,
 
 	qp->rq_wrid_array = info->rq_wrid_array;
 	qp->wqe_alloc_db = info->wqe_alloc_db;
+	qp->rd_fence_rate = info->rd_fence_rate;
 	qp->qp_id = info->qp_id;
 	qp->sq_size = info->sq_size;
 	qp->push_mode = false;
@@ -1528,6 +2156,7 @@ int irdma_uk_qp_init(struct irdma_qp_uk *qp,
 	sq_ring_size = qp->sq_size << info->sq_shift;
 	IRDMA_RING_INIT(qp->sq_ring, sq_ring_size);
 	IRDMA_RING_INIT(qp->initial_ring, sq_ring_size);
+	atomic_init(&qp->sq_ring.post_cnt, 0);
 	if (info->first_sq_wq) {
 		irdma_setup_connection_wqes(qp, info);
 		qp->swqe_polarity = 1;
@@ -1547,6 +2176,11 @@ int irdma_uk_qp_init(struct irdma_qp_uk *qp,
 		qp->wqe_ops = iw_wqe_uk_ops_gen_1;
 	else
 		qp->wqe_ops = iw_wqe_uk_ops;
+	qp->sq_sigwrtrk_array = info->sq_sigwrtrk_array;
+	IRDMA_RING_INIT(qp->sq_sig_ring, sq_ring_size);
+	qp->srq_uk = info->srq_uk;
+	qp->start_wqe_idx = info->start_wqe_idx;
+
 	return ret_code;
 }
 
@@ -1595,6 +2229,9 @@ void irdma_uk_clean_cq(void *q, struct irdma_cq_uk *cq)
 		if (polarity != temp)
 			break;
 
+		/* Ensure CQE contents are read after valid bit is checked */
+		udma_from_device_barrier();
+
 		get_64bit_val(cqe, 8, &comp_ctx);
 		if ((void *)(uintptr_t)comp_ctx == q)
 			set_64bit_val(cqe, 8, 0);
@@ -1603,46 +2240,6 @@ void irdma_uk_clean_cq(void *q, struct irdma_cq_uk *cq)
 		if (!cq_head)
 			temp ^= 1;
 	} while (true);
-}
-
-/**
- * irdma_nop - post a nop
- * @qp: hw qp ptr
- * @wr_id: work request id
- * @signaled: signaled for completion
- * @post_sq: ring doorbell
- */
-int irdma_nop(struct irdma_qp_uk *qp, __u64 wr_id, bool signaled, bool post_sq)
-{
-	__le64 *wqe;
-	__u64 hdr;
-	__u32 wqe_idx;
-	struct irdma_post_sq_info info = {};
-
-	info.push_wqe = false;
-	info.wr_id = wr_id;
-	wqe = irdma_qp_get_next_send_wqe(qp, &wqe_idx, IRDMA_QP_WQE_MIN_QUANTA,
-					 0, &info);
-	if (!wqe)
-		return ENOMEM;
-
-	irdma_clr_wqes(qp, wqe_idx);
-
-	set_64bit_val(wqe, 0, 0);
-	set_64bit_val(wqe, 8, 0);
-	set_64bit_val(wqe, 16, 0);
-
-	hdr = FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_NOP) |
-	      FIELD_PREP(IRDMAQPSQ_SIGCOMPL, signaled) |
-	      FIELD_PREP(IRDMAQPSQ_VALID, qp->swqe_polarity);
-
-	udma_to_device_barrier(); /* make sure WQE is populated before valid bit is set */
-
-	set_64bit_val(wqe, 24, hdr);
-	if (post_sq)
-		irdma_uk_qp_post_wr(qp);
-
-	return 0;
 }
 
 /**
@@ -1729,3 +2326,4 @@ int irdma_fragcnt_to_wqesize_rq(__u32 frag_cnt, __u16 *wqe_size)
 
 	return 0;
 }
+
