@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB */
-/* Copyright (C) 2019 - 2020 Intel Corporation */
+/* Copyright (C) 2019 - 2023 Intel Corporation */
 #ifndef PROVIDER_IRDMA_ABI_H
 #define PROVIDER_IRDMA_ABI_H
 
@@ -22,7 +22,7 @@ DECLARE_DRV_CMD(irdma_uresize_cq, IB_USER_VERBS_CMD_RESIZE_CQ,
 DECLARE_DRV_CMD(irdma_ucreate_qp, IB_USER_VERBS_CMD_CREATE_QP,
 		irdma_create_qp_req, irdma_create_qp_resp);
 DECLARE_DRV_CMD(irdma_umodify_qp, IB_USER_VERBS_EX_CMD_MODIFY_QP,
-		irdma_modify_qp_req, irdma_modify_qp_resp);
+		empty, irdma_modify_qp_resp);
 DECLARE_DRV_CMD(irdma_get_context, IB_USER_VERBS_CMD_GET_CONTEXT,
 		irdma_alloc_ucontext_req, irdma_alloc_ucontext_resp);
 DECLARE_DRV_CMD(irdma_ureg_mr, IB_USER_VERBS_CMD_REG_MR,
@@ -31,5 +31,15 @@ DECLARE_DRV_CMD(irdma_urereg_mr, IB_USER_VERBS_CMD_REREG_MR,
 		irdma_mem_reg_req, empty);
 DECLARE_DRV_CMD(irdma_ucreate_ah, IB_USER_VERBS_CMD_CREATE_AH,
 		empty, irdma_create_ah_resp);
+DECLARE_DRV_CMD(irdma_ucreate_srq, IB_USER_VERBS_CMD_CREATE_SRQ,
+		irdma_create_srq_req, irdma_create_srq_resp);
 
+struct irdma_modify_qp_cmd {
+	struct ibv_modify_qp_ex ibv_cmd;
+	__u8 sq_flush;
+	__u8 rq_flush;
+	__u8 rca_key_present;
+	__u8 rsvd[5];
+	__u64 rca_key[2];
+};
 #endif /* PROVIDER_IRDMA_ABI_H */

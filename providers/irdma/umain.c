@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
 /* Copyright (C) 2019 - 2023 Intel Corporation */
+#if HAVE_CONFIG_H
 #include <config.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,11 +12,24 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 #include "ice_devids.h"
 #include "i40e_devids.h"
+#include "idpf_devids.h"
 #include "umain.h"
 #include "abi.h"
+
+unsigned int irdma_dbg;
+static pthread_t dbg_thread;
+static pthread_cond_t cond_sigusr1_rcvd;
+static _Atomic(int) dbg_thread_exit;
+static _Atomic(int) dev_allocated_refcount;
+pthread_mutex_t sigusr1_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+LIST_HEAD(dbg_ucq_list);	/* list of alive cqs */
+LIST_HEAD(dbg_uqp_list);	/* list of alive qps */
 
 #define INTEL_HCA(v, d) VERBS_PCI_MATCH(v, d, NULL)
 static const struct verbs_match_ent hca_table[] = {
@@ -56,6 +71,8 @@ static const struct verbs_match_ent hca_table[] = {
 	INTEL_HCA(I40E_INTEL_VENDOR_ID, I40E_DEV_ID_X722_VF),
 	INTEL_HCA(I40E_INTEL_VENDOR_ID, I40E_DEV_ID_X722_VF_HV),
 
+	INTEL_HCA(PCI_VENDOR_ID_INTEL, IDPF_DEV_ID_PF),
+	INTEL_HCA(PCI_VENDOR_ID_INTEL, IAVF_DEV_ID_ADAPTIVE_VF),
 	{}
 };
 
@@ -69,17 +86,32 @@ static void irdma_ufree_context(struct ibv_context *ibctx)
 
 	iwvctx = container_of(ibctx, struct irdma_uvcontext,
 			      ibv_ctx.context);
-
 	irdma_ufree_pd(&iwvctx->iwupd->ibv_pd);
-	irdma_munmap(iwvctx->db);
+	irdma_munmap(iwvctx->db, IRDMA_HW_PAGE_SIZE);
 	verbs_uninit_context(&iwvctx->ibv_ctx);
+	irdma_spin_destroy(&iwvctx->pd_lock);
+
 	free(iwvctx);
 }
+
+static const struct verbs_context_ops irdma_uctx_mcast_ops = {
+	.attach_mcast = irdma_uattach_mcast,
+	.detach_mcast = irdma_udetach_mcast,
+};
+
+static const struct verbs_context_ops irdma_uctx_srq_ops = {
+	.create_srq = irdma_ucreate_srq,
+	.destroy_srq = irdma_udestroy_srq,
+	.modify_srq = irdma_umodify_srq,
+	.post_srq_recv = irdma_upost_srq,
+	.query_srq = irdma_uquery_srq,
+};
 
 static const struct verbs_context_ops irdma_uctx_ops = {
 	.alloc_mw = irdma_ualloc_mw,
 	.alloc_pd = irdma_ualloc_pd,
-	.attach_mcast = irdma_uattach_mcast,
+	.alloc_parent_domain = irdma_ualloc_parent_domain,
+	.alloc_td = irdma_ualloc_td,
 	.bind_mw = irdma_ubind_mw,
 	.cq_event = irdma_cq_event,
 	.create_ah = irdma_ucreate_ah,
@@ -88,11 +120,11 @@ static const struct verbs_context_ops irdma_uctx_ops = {
 	.create_qp = irdma_ucreate_qp,
 	.dealloc_mw = irdma_udealloc_mw,
 	.dealloc_pd = irdma_ufree_pd,
+	.dealloc_td = irdma_udealloc_td,
 	.dereg_mr = irdma_udereg_mr,
 	.destroy_ah = irdma_udestroy_ah,
 	.destroy_cq = irdma_udestroy_cq,
 	.destroy_qp = irdma_udestroy_qp,
-	.detach_mcast = irdma_udetach_mcast,
 	.modify_qp = irdma_umodify_qp,
 	.poll_cq = irdma_upoll_cq,
 	.post_recv = irdma_upost_recv,
@@ -147,27 +179,41 @@ static struct verbs_context *irdma_ualloc_context(struct ibv_device *ibdev,
 	struct irdma_get_context_resp resp = {};
 	__u64 mmap_key;
 	__u8 user_ver = IRDMA_ABI_VER;
+	int ret;
 
 	iwvctx = verbs_init_and_alloc_context(ibdev, cmd_fd, iwvctx, ibv_ctx,
 					      RDMA_DRIVER_IRDMA);
 	if (!iwvctx)
 		return NULL;
 
+	if (irdma_spin_init(&iwvctx->pd_lock, false)) {
+		free(iwvctx);
+		return NULL;
+	}
+
 	cmd.comp_mask |= IRDMA_ALLOC_UCTX_USE_RAW_ATTR;
+	cmd.comp_mask |= IRDMA_SUPPORT_WQE_FORMAT_V2;
+retry:
 	cmd.userspace_ver = user_ver;
-	if (ibv_cmd_get_context(&iwvctx->ibv_ctx,
-				(struct ibv_get_context *)&cmd, sizeof(cmd),
-				NULL, &resp.ibv_resp, sizeof(resp))) {
-		cmd.userspace_ver = 4;
-		if (ibv_cmd_get_context(&iwvctx->ibv_ctx,
-					(struct ibv_get_context *)&cmd,
-					sizeof(cmd), NULL, &resp.ibv_resp,
-					sizeof(resp)))
-			goto err_free;
-		user_ver = cmd.userspace_ver;
+#if 1
+	ret = ibv_cmd_get_context(&iwvctx->ibv_ctx, (struct ibv_get_context *)&cmd,
+				  sizeof(cmd), NULL, &resp.ibv_resp, sizeof(resp));
+#else
+	ret = ibv_cmd_get_context(&iwvctx->ibv_ctx, (struct ibv_get_context *)&cmd,
+				  sizeof(cmd), &resp.ibv_resp, sizeof(resp));
+#endif
+	if (ret) {
+		if (--user_ver >= 4)
+			goto retry;
+
+		goto err_free;
 	}
 
 	verbs_set_ops(&iwvctx->ibv_ctx, &irdma_uctx_ops);
+	if (resp.hw_rev == IRDMA_GEN_2 && ibdev->transport_type != IBV_TRANSPORT_IWARP)
+		verbs_set_ops(&iwvctx->ibv_ctx, &irdma_uctx_mcast_ops);
+	if (resp.feature_flags & IRDMA_FEATURE_SRQ)
+		verbs_set_ops(&iwvctx->ibv_ctx, &irdma_uctx_srq_ops);
 
 	/* Legacy i40iw does not populate hw_rev. The irdma driver always sets it */
 	if (!resp.hw_rev) {
@@ -193,16 +239,22 @@ static struct verbs_context *irdma_ualloc_context(struct ibv_device *ibdev,
 			iwvctx->uk_attrs.min_hw_wq_size = resp.min_hw_wq_size;
 		else
 			iwvctx->uk_attrs.min_hw_wq_size = IRDMA_QP_SW_MIN_WQSIZE;
+		iwvctx->uk_attrs.max_hw_srq_quanta = resp.max_hw_srq_quanta;
+		if (resp.comp_mask & IRDMA_SUPPORT_MAX_HW_PUSH_LEN)
+			iwvctx->uk_attrs.max_hw_push_len = resp.max_hw_push_len;
+		else
+			iwvctx->uk_attrs.max_hw_push_len = IRDMA_DEFAULT_MAX_PUSH_LEN;
 		mmap_key = resp.db_mmap_key;
 	}
 
-	iwvctx->db = irdma_mmap(cmd_fd, mmap_key);
+	iwvctx->db = irdma_mmap(cmd_fd, IRDMA_HW_PAGE_SIZE, mmap_key);
 	if (iwvctx->db == MAP_FAILED)
 		goto err_free;
 
+	list_head_init(&iwvctx->pd_list);
 	ibv_pd = irdma_ualloc_pd(&iwvctx->ibv_ctx.context);
 	if (!ibv_pd) {
-		irdma_munmap(iwvctx->db);
+		irdma_munmap(iwvctx->db, IRDMA_HW_PAGE_SIZE);
 		goto err_free;
 	}
 
@@ -211,6 +263,9 @@ static struct verbs_context *irdma_ualloc_context(struct ibv_device *ibdev,
 	return &iwvctx->ibv_ctx;
 
 err_free:
+	fprintf(stderr, PFX "%s: failed to allocate context for device, kernel ver:%d, user ver:%d hw_rev=%d\n",
+		__func__, resp.kernel_ver, IRDMA_ABI_VER, resp.hw_rev);
+	irdma_spin_destroy(&iwvctx->pd_lock);
 	free(iwvctx);
 
 	return NULL;
@@ -220,18 +275,111 @@ static void irdma_uninit_device(struct verbs_device *verbs_device)
 {
 	struct irdma_udevice *dev;
 
+	if (!verbs_device) {
+		fprintf(stderr, PFX "%s: called with NULL ptr.\n", __func__);
+		return;
+	}
+	/* Destroy debug_thread only upon last call to irdma_uninit_device.
+	 * dev_allocated_refcount tracks number of devices created
+	 */
+	if (irdma_dbg && atomic_fetch_sub(&dev_allocated_refcount, 1) == 1) {
+		atomic_store(&dbg_thread_exit, 1);
+		if (!pthread_cond_signal(&cond_sigusr1_rcvd)) {
+			int ret;
+
+			ret = pthread_join(dbg_thread, NULL);
+			if (ret)
+				fprintf(stderr, PFX "%s: failed to pthread join the dbg thread error:%d\n",
+					__func__, ret);
+			pthread_mutex_destroy(&sigusr1_wait_mutex);
+			pthread_cond_destroy(&cond_sigusr1_rcvd);
+		}
+	}
 	dev = container_of(&verbs_device->device, struct irdma_udevice,
 			   ibv_dev.device);
 	free(dev);
 }
 
+static void *dump_data_handler(void *unused)
+{
+	struct irdma_ucq *dbg_ucq, *next;
+	struct irdma_uqp *dbg_uqp, *next_qp;
+	int ret = 0;
+
+	pthread_mutex_lock(&sigusr1_wait_mutex);
+	while (1) {
+		ret = pthread_cond_wait(&cond_sigusr1_rcvd, &sigusr1_wait_mutex);
+
+		if (ret || atomic_load(&dbg_thread_exit)) {
+			pthread_mutex_unlock(&sigusr1_wait_mutex);
+			return NULL;
+		}
+
+		list_for_each_safe(&dbg_ucq_list, dbg_ucq, next, dbg_entry) {
+			ret = irdma_spin_lock(&dbg_ucq->lock);
+			if (ret) {
+				pthread_mutex_unlock(&sigusr1_wait_mutex);
+				return NULL;
+			}
+			irdma_print_cqes(&dbg_ucq->cq);
+			irdma_spin_unlock(&dbg_ucq->lock);
+		}
+
+		list_for_each_safe(&dbg_uqp_list, dbg_uqp, next_qp, dbg_entry) {
+			ret = irdma_spin_lock(&dbg_uqp->lock);
+			if (ret) {
+				pthread_mutex_unlock(&sigusr1_wait_mutex);
+				return NULL;
+			}
+			irdma_print_sq_wqes(&dbg_uqp->qp);
+			irdma_spin_unlock(&dbg_uqp->lock);
+		}
+	}
+	pthread_mutex_unlock(&sigusr1_wait_mutex);
+}
+
+static void irdma_signal_handler(int signum)
+{
+	switch (signum) {
+	case SIGUSR1:
+		fprintf(stdout, "%s: Received SIGUSR1 signal\n", __func__);
+		pthread_cond_signal(&cond_sigusr1_rcvd);
+		break;
+	default:
+		fprintf(stdout, "%s: Unhandled signal %d\n", __func__, signum);
+		break;
+	}
+}
+
 static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 {
 	struct irdma_udevice *dev;
+	char *env_val;
 
 	dev = calloc(1, sizeof(*dev));
 	if (!dev)
 		return NULL;
+
+	env_val = getenv("IRDMA_DEBUG");
+	if (env_val)
+		irdma_dbg = atoi(env_val);
+
+	/* Create debug_thread only once upon first call to irdma_device_alloc
+	 * dev_allocated_refcount tracks number of devices created
+	 */
+	if (irdma_dbg && !atomic_fetch_add(&dev_allocated_refcount, 1)) {
+		int ret;
+
+		signal(SIGUSR1, irdma_signal_handler);
+		pthread_cond_init(&cond_sigusr1_rcvd, NULL);
+
+		ret = pthread_create(&dbg_thread, NULL, dump_data_handler, NULL);
+		if (ret) {
+			free(dev);
+			pthread_cond_destroy(&cond_sigusr1_rcvd);
+			return NULL;
+		}
+	}
 
 	return &dev->ibv_dev;
 }

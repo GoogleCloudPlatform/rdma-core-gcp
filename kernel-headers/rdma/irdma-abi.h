@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: (GPL-2.0 WITH Linux-syscall-note) OR Linux-OpenIB */
+/* SPDX-License-Identifier: (GPL-2.0 WITH Linux-syscall-note) OR Linux-OpenIB) */
 /*
- * Copyright (c) 2006 - 2021 Intel Corporation.  All rights reserved.
+ * Copyright (c) 2006 - 2022 Intel Corporation.  All rights reserved.
  * Copyright (c) 2005 Topspin Communications.  All rights reserved.
  * Copyright (c) 2005 Cisco Systems.  All rights reserved.
  * Copyright (c) 2005 Open Grid Computing, Inc. All rights reserved.
@@ -28,6 +28,11 @@ enum {
 	IRDMA_ALLOC_UCTX_MIN_HW_WQ_SIZE = 1 << 1,
 	IRDMA_ALLOC_UCTX_MAX_HW_SRQ_QUANTA = 1 << 2,
 	IRDMA_SUPPORT_WQE_FORMAT_V2 = 1 << 3,
+	IRDMA_SUPPORT_MAX_HW_PUSH_LEN = 1 << 4,
+};
+
+enum {
+	IRDMA_CREATE_QP_USE_START_WQE_IDX = 1 << 0,
 };
 
 struct irdma_alloc_ucontext_req {
@@ -58,7 +63,7 @@ struct irdma_alloc_ucontext_resp {
 	__aligned_u64 comp_mask;
 	__u16 min_hw_wq_size;
 	__u32 max_hw_srq_quanta;
-	__u8 rsvd3[2];
+	__u16 max_hw_push_len;
 };
 
 struct irdma_alloc_pd_resp {
@@ -88,6 +93,7 @@ struct irdma_create_srq_resp {
 struct irdma_create_qp_req {
 	__aligned_u64 user_wqe_bufs;
 	__aligned_u64 user_compl_ctx;
+	__aligned_u64 comp_mask;
 };
 
 struct irdma_mem_reg_req {
@@ -100,7 +106,9 @@ struct irdma_mem_reg_req {
 struct irdma_modify_qp_req {
 	__u8 sq_flush;
 	__u8 rq_flush;
-	__u8 rsvd[6];
+	__u8 rca_key_present;
+	__u8 rsvd[5];
+	__u64 rca_key[2];
 };
 
 struct irdma_create_cq_resp {
@@ -117,6 +125,9 @@ struct irdma_create_qp_resp {
 	__u8 lsmm;
 	__u8 rsvd;
 	__u32 qp_caps;
+	__aligned_u64 comp_mask;
+	__u8 start_wqe_idx;
+	__u8 rsvd2[7];
 };
 
 struct irdma_modify_qp_resp {
@@ -124,11 +135,20 @@ struct irdma_modify_qp_resp {
 	__aligned_u64 push_db_mmap_key;
 	__u16 push_offset;
 	__u8 push_valid;
-	__u8 rsvd[5];
+	__u8 rd_fence_rate;
+	__u8 rsvd[4];
 };
 
 struct irdma_create_ah_resp {
 	__u32 ah_id;
 	__u8 rsvd[4];
+};
+
+#define IRDMA_MMAP_CMD_SHIFT	8
+#define IRDMA_MMAP_CMD_MASK	0xff
+
+enum irdma_mmap_cmd {
+	IRDMA_MMAP_DEFAULT	= 0,
+	IRDMA_MMAP_GET_KMEM	= 1,
 };
 #endif /* IRDMA_ABI_H */
