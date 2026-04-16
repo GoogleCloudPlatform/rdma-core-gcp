@@ -935,15 +935,9 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 	cmd.user_cq_buf = (__u64)((uintptr_t)info.cq_base);
 	cmd.user_shadow_area = (__u64)((uintptr_t)info.shadow_area);
 
-#ifdef IBV_CMD_CREATE_CQ_EX_VER_2
 	ret = ibv_cmd_create_cq_ex(context, attr_ex, NULL, &iwucq->verbs_cq,
 				   &cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp,
 				   sizeof(resp), 0);
-#else
-	ret = ibv_cmd_create_cq_ex(context, attr_ex, &iwucq->verbs_cq,
-				   &cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp,
-				   sizeof(resp), 0);
-#endif /* IBV_CMD_CREATE_CQ_EX_VER_2 */
 	attr_ex->cqe = ncqe;
 	if (ret)
 		goto err_create_cq;
