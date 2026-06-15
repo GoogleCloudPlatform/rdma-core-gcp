@@ -512,6 +512,7 @@ static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 	struct ibv_context *ctx;
 	struct ibv_device_attr_ex device_attr = {};
 	struct ibv_port_attr port_attr;
+	uint64_t port_speed;
 	int rc = 0;
 	uint32_t port;
 	char buf[256];
@@ -667,6 +668,11 @@ static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 							   speed_str(port_attr.active_speed),
 			       port_attr.active_speed_ex ? port_attr.active_speed_ex :
 							   port_attr.active_speed);
+			rc = ibv_query_port_speed(ctx, port, &port_speed);
+			/* effective_speed is shown only if the verb is supported and succeeded */
+			if (!rc)
+				printf("\t\t\teffective_speed:\t%.1f Gbps\n",
+				       port_speed / 10.0);
 			if (ib_dev->transport_type == IBV_TRANSPORT_IB)
 				printf("\t\t\tphys_state:\t\t%s (%d)\n",
 				       port_phy_state_str(port_attr.phys_state), port_attr.phys_state);
