@@ -46,6 +46,8 @@ ibdiag_programs(
   vendstat
   )
 
+target_link_libraries(ibstat LINK_PRIVATE ibverbs)
+
 rdma_test_executable(ibsendtrap "ibsendtrap.c")
 target_link_libraries(ibsendtrap LINK_PRIVATE ibdiags_tools ibumad ibmad)
 rdma_test_executable(mcm_rereg_test "mcm_rereg_test.c")

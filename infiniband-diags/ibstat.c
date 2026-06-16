@@ -47,6 +47,7 @@
 #include <linux/types.h> /* __be64 */
 
 #include <infiniband/umad.h>
+#include <infiniband/verbs.h>
 
 #include <ibdiag_common.h>
 
@@ -163,7 +164,28 @@ done:
 	return fdr10;
 }
 
-static int port_dump(umad_port_t * port, int alone)
+static struct ibv_context *open_ibv_ctx(const char *ca_name)
+{
+	struct ibv_device **dev_list;
+	struct ibv_context *ctx = NULL;
+	int i;
+
+	dev_list = ibv_get_device_list(NULL);
+	if (!dev_list)
+		return NULL;
+
+	for (i = 0; dev_list[i]; i++) {
+		if (!strcmp(ibv_get_device_name(dev_list[i]), ca_name)) {
+			ctx = ibv_open_device(dev_list[i]);
+			break;
+		}
+	}
+
+	ibv_free_device_list(dev_list);
+	return ctx;
+}
+
+static int port_dump(umad_port_t *port, int alone, struct ibv_context *ctx)
 {
 	const char *pre = "";
 	const char *hdrpre = "";
@@ -189,6 +211,16 @@ static int port_dump(umad_port_t * port, int alone)
 		printf("%sRate: %d\n", pre, port->rate);
 	else
 		printf("%sRate: 2.5\n", pre);
+	if (ctx) {
+		uint64_t effective_speed;
+		int rc = ibv_query_port_speed(ctx, port->portnum,
+					      &effective_speed);
+
+		/* Effective speed is shown only if the verb is supported and succeeded */
+		if (!rc)
+			printf("%sEffective speed: %g\n", pre,
+			       effective_speed / 10.0);
+	}
 	printf("%sBase lid: %d\n", pre, port->base_lid);
 	printf("%sLMC: %d\n", pre, port->lmc);
 	printf("%sSM lid: %d\n", pre, port->sm_lid);
@@ -231,6 +263,7 @@ static int port_has_cm_cap(const char *ca_name, int portnum)
 
 static int ca_stat(const char *ca_name, int portnum, int no_ports)
 {
+	struct ibv_context *ctx;
 	umad_ca_t ca;
 	int r, check_port;
 
@@ -251,32 +284,38 @@ static int ca_stat(const char *ca_name, int portnum, int no_ports)
 	if (!ca.node_type)
 		return 0;
 
+	ctx = open_ibv_ctx(ca_name);
+
 	if (!no_ports && portnum >= 0) {
 		if (portnum > ca.numports || !ca.ports[portnum]) {
 			IBWARN("%s: '%s' has no port number %d - max (%d)",
 			       ((unsigned)ca.node_type <=
 				IB_NODE_MAX ? node_type_str[ca.node_type] :
 				"???"), ca_name, portnum, ca.numports);
-			return -1;
+			r = -1;
+			goto out;
 		}
 		printf("%s: '%s'\n",
 		       ((unsigned)ca.node_type <=
 			IB_NODE_MAX ? node_type_str[ca.node_type] : "???"),
 		       ca.ca_name);
-		port_dump(ca.ports[portnum], 1);
-		return 0;
+		port_dump(ca.ports[portnum], 1, ctx);
+		goto out;
 	}
 
 	/* print ca header */
 	ca_dump(&ca);
 
 	if (no_ports)
-		return 0;
+		goto out;
 
 	for (portnum = 0; portnum <= ca.numports; portnum++)
-		port_dump(ca.ports[portnum], 0);
+		port_dump(ca.ports[portnum], 0, ctx);
 
-	return 0;
+out:
+	if (ctx)
+		ibv_close_device(ctx);
+	return r;
 }
 
 static int ports_list(struct umad_device_node *first_node,
