@@ -947,7 +947,9 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 	info.cq_id = resp.cq_id;
 	/* Do not report the CQE's reserved for immediate and burned by HW */
 	iwucq->verbs_cq.cq.cqe = ncqe;
-
+	if (cqe_64byte_ena)
+		info.avoid_mem_cflct = true;
+	info.enable_cq_empty_check = (attr_ex->channel != NULL);
 	info.cqe_alloc_db = (__u32 *)((__u8 *)iwvctx->db + IRDMA_DB_CQ_OFFSET);
 	irdma_uk_cq_init(&iwucq->cq, &info);
 	pthread_mutex_lock(&sigusr1_wait_mutex);
