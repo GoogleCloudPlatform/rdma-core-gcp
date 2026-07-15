@@ -57,6 +57,30 @@ enum {
 	    IBV_WC_EX_WITH_DLID_PATH_BITS
 };
 
+enum {
+	IONIC_QP_REQUIRED_COMP_MASK =
+		IBV_QP_INIT_ATTR_PD,
+
+	IONIC_QP_SUPPORTED_COMP_MASK_RC =
+		IONIC_QP_REQUIRED_COMP_MASK		|
+		IBV_QP_INIT_ATTR_SEND_OPS_FLAGS,
+
+	IONIC_QP_SUPPORTED_COMP_MASK_UD =
+		IONIC_QP_REQUIRED_COMP_MASK,
+
+	IONIC_QP_SUPPORTED_SEND_OPS_FLAGS =
+		IBV_QP_EX_WITH_RDMA_WRITE		|
+		IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM	|
+		IBV_QP_EX_WITH_SEND			|
+		IBV_QP_EX_WITH_SEND_WITH_IMM		|
+		IBV_QP_EX_WITH_RDMA_READ		|
+		IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP	|
+		IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD	|
+		IBV_QP_EX_WITH_LOCAL_INV		|
+		IBV_QP_EX_WITH_BIND_MW			|
+		IBV_QP_EX_WITH_SEND_WITH_INV,
+};
+
 struct ionic_ctx {
 	struct verbs_context	vctx;
 
@@ -207,6 +231,8 @@ struct ionic_qp {
 
 	struct ionic_sq		sq;
 	struct ionic_rq		rq;
+	struct ibv_send_wr	ex_wr;
+	int			ex_rc;
 	bool			sig_all;
 };
 
@@ -291,6 +317,11 @@ static inline struct ionic_cq *to_ionic_vcq_cq(struct ibv_cq *ibcq,
 static inline struct ionic_qp *to_ionic_qp(struct ibv_qp *ibqp)
 {
 	return container_of(ibqp, struct ionic_qp, vqp.qp);
+}
+
+static inline struct ionic_qp *to_ionic_qp_ex(struct ibv_qp_ex *ibqp_ex)
+{
+	return container_of(ibqp_ex, struct ionic_qp, vqp.qp_ex);
 }
 
 static inline struct ionic_ah *to_ionic_ah(struct ibv_ah *ibah)

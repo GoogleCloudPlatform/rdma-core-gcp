@@ -23,6 +23,9 @@
 
 static void ionic_reserve_sync_cq(struct ionic_ctx *ctx, struct ionic_cq *cq);
 static int ionic_poll_cq(struct ibv_cq *ibcq, int nwc, struct ibv_wc *wc);
+static void ionic_post_send_cmb(struct ionic_ctx *ctx, struct ionic_qp *qp);
+static int ionic_v1_prep_one_rc(struct ionic_qp *qp, struct ibv_send_wr *wr,
+				bool send_path);
 
 #ifdef __x86_64__
 static bool ionic_have_movdir64b;
@@ -1713,6 +1716,283 @@ static void ionic_qp_rq_destroy(struct ionic_qp *qp)
 	ionic_queue_destroy(&qp->rq.queue);
 }
 
+static void ionic_wr_start(struct ibv_qp_ex *ibqp_ex)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ionic_cq *cq = to_ionic_vcq_cq(qp->vqp.qp.send_cq, qp->udma_idx);
+
+	ionic_cq_spin_lock(cq);
+	ionic_sq_spin_lock(qp);
+
+	qp->ex_rc = 0;
+
+	if (unlikely(!qp->has_sq))
+		qp->ex_rc = EINVAL;
+
+	if (unlikely(qp->vqp.qp.state < IBV_QPS_RTS))
+		qp->ex_rc = EINVAL;
+}
+
+static void ionic_wr_abort(struct ibv_qp_ex *ibqp_ex)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ionic_cq *cq = to_ionic_vcq_cq(qp->vqp.qp.send_cq, qp->udma_idx);
+
+	qp->sq.queue.prod = qp->sq.old_prod;
+
+	ionic_sq_spin_unlock(qp);
+	ionic_cq_spin_unlock(cq);
+}
+
+static int ionic_wr_complete(struct ibv_qp_ex *ibqp_ex)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ionic_cq *cq = to_ionic_vcq_cq(qp->vqp.qp.send_cq, qp->udma_idx);
+	struct ionic_ctx *ctx = to_ionic_ctx(qp->vqp.qp.context);
+	int spend, rc = qp->ex_rc;
+
+	if (rc) {
+		ionic_wr_abort(ibqp_ex);
+		return rc;
+	}
+
+	if (likely(qp->sq.queue.prod != qp->sq.old_prod)) {
+		/* ring cq doorbell just in time */
+		spend = (qp->sq.queue.prod - qp->sq.old_prod) & qp->sq.queue.mask;
+		ionic_reserve_cq(ctx, cq, spend);
+
+		qp->sq.old_prod = qp->sq.queue.prod;
+
+		if (qp->sq.cmb_ptr) {
+			ionic_post_send_cmb(ctx, qp);
+		} else {
+			udma_to_device_barrier();
+			verbs_debug(&ctx->vctx, "dbell qp %u sq val %" PRIx64,
+				    qp->qpid, ionic_queue_dbell_val(&qp->sq.queue));
+			ionic_dbell_ring(&ctx->dbpage[ctx->sq_qtype],
+					 ionic_queue_dbell_val(&qp->sq.queue));
+		}
+	}
+
+	if (qp->sq.flush) {
+		cq->flush = true;
+		list_del(&qp->cq_flush_sq);
+		list_add_tail(&cq->flush_sq, &qp->cq_flush_sq);
+	}
+
+	ionic_sq_spin_unlock(qp);
+	ionic_cq_spin_unlock(cq);
+
+	return 0;
+}
+
+static void ionic_wr_set(struct ionic_qp *qp, int wr_flags, size_t num_sge,
+			 const struct ibv_sge *sg_list)
+{
+	if (qp->ex_rc)
+		return;
+
+	qp->ex_wr.send_flags = qp->vqp.qp_ex.wr_flags | wr_flags,
+	qp->ex_wr.sg_list = (struct ibv_sge *)sg_list;
+	qp->ex_wr.num_sge = num_sge;
+
+	qp->ex_rc = ionic_v1_prep_one_rc(qp, &qp->ex_wr, true);
+}
+
+static void ionic_wr_set_sge(struct ibv_qp_ex *ibqp_ex, uint32_t lkey, uint64_t addr,
+			     uint32_t length)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_sge sge = {
+		.addr = addr,
+		.length = length,
+		.lkey = lkey,
+	};
+
+	ionic_wr_set(qp, 0, 1, &sge);
+}
+
+static void ionic_wr_set_sge_list(struct ibv_qp_ex *ibqp_ex, size_t num_sge,
+				  const struct ibv_sge *sg_list)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+
+	ionic_wr_set(qp, 0, num_sge, sg_list);
+}
+
+static void ionic_wr_set_inline_data(struct ibv_qp_ex *ibqp_ex, void *addr, size_t length)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_sge sge = {
+		.addr = (uintptr_t)addr,
+		.length = length,
+	};
+
+	ionic_wr_set(qp, IBV_SEND_INLINE, 1, &sge);
+}
+
+static void ionic_wr_set_inline_data_list(struct ibv_qp_ex *ibqp_ex, size_t num_buf,
+					  const struct ibv_data_buf *buf_list)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_sge *sg_list;
+	int sge_i;
+
+	sg_list = calloc(num_buf, sizeof(*sg_list));
+	if (!sg_list) {
+		qp->ex_rc = ENOMEM;
+		return;
+	}
+
+	for (sge_i = 0; sge_i < num_buf; ++sge_i) {
+		sg_list[sge_i].addr = (uintptr_t)buf_list[sge_i].addr;
+		sg_list[sge_i].length = buf_list[sge_i].length;
+	}
+
+	ionic_wr_set(qp, IBV_SEND_INLINE, num_buf, sg_list);
+	free(sg_list);
+}
+
+static void ionic_wr_rdma_write(struct ibv_qp_ex *ibqp_ex, uint32_t rkey,
+				uint64_t remote_addr)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_RDMA_WRITE,
+		.wr.rdma.remote_addr = remote_addr,
+		.wr.rdma.rkey = rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_rdma_write_imm(struct ibv_qp_ex *ibqp_ex, uint32_t rkey,
+				    uint64_t remote_addr, __be32 imm_data)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+		.imm_data = imm_data,
+		.wr.rdma.remote_addr = remote_addr,
+		.wr.rdma.rkey = rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_rdma_read(struct ibv_qp_ex *ibqp_ex, uint32_t rkey,
+			       uint64_t remote_addr)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_RDMA_READ,
+		.wr.rdma.remote_addr = remote_addr,
+		.wr.rdma.rkey = rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_send(struct ibv_qp_ex *ibqp_ex)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_SEND,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_send_imm(struct ibv_qp_ex *ibqp_ex, __be32 imm_data)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_SEND_WITH_IMM,
+		.imm_data = imm_data,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_send_inv(struct ibv_qp_ex *ibqp_ex, uint32_t invalidate_rkey)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_SEND_WITH_INV,
+		.invalidate_rkey = invalidate_rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_atomic_cmp_swp(struct ibv_qp_ex *ibqp_ex, uint32_t rkey,
+				    uint64_t remote_addr, uint64_t compare,
+				    uint64_t swap)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_ATOMIC_CMP_AND_SWP,
+		.wr.atomic.remote_addr = remote_addr,
+		.wr.atomic.compare_add = compare,
+		.wr.atomic.swap = swap,
+		.wr.atomic.rkey = rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_atomic_fetch_add(struct ibv_qp_ex *ibqp_ex, uint32_t rkey,
+				      uint64_t remote_addr, uint64_t add)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD,
+		.wr.atomic.remote_addr = remote_addr,
+		.wr.atomic.compare_add = add,
+		.wr.atomic.rkey = rkey,
+	};
+
+	qp->ex_wr = wr;
+}
+
+static void ionic_wr_bind_mw(struct ibv_qp_ex *ibqp_ex, struct ibv_mw *mw,
+			     uint32_t rkey,
+			     const struct ibv_mw_bind_info *bind_info)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_BIND_MW,
+		.bind_mw.mw = mw,
+		.bind_mw.rkey = rkey,
+		.bind_mw.bind_info = *bind_info,
+	};
+
+	qp->ex_wr = wr;
+	ionic_wr_set(qp, 0, 0, NULL);
+}
+
+static void ionic_wr_local_inv(struct ibv_qp_ex *ibqp_ex, uint32_t invalidate_rkey)
+{
+	struct ionic_qp *qp = to_ionic_qp_ex(ibqp_ex);
+	struct ibv_send_wr wr = {
+		.wr_id = qp->vqp.qp_ex.wr_id,
+		.opcode = IBV_WR_LOCAL_INV,
+		.invalidate_rkey = invalidate_rkey,
+	};
+
+	qp->ex_wr = wr;
+	ionic_wr_set(qp, 0, 0, NULL);
+}
+
 static struct ibv_qp *ionic_create_qp_ex(struct ibv_context *ibctx,
 					 struct ibv_qp_init_attr_ex *ex)
 {
@@ -1723,6 +2003,35 @@ static struct ibv_qp *ionic_create_qp_ex(struct ibv_context *ibctx,
 	struct ionic_qp *qp;
 	struct ionic_cq *cq;
 	int rc;
+
+	if ((ex->comp_mask & IONIC_QP_REQUIRED_COMP_MASK) !=
+	    IONIC_QP_REQUIRED_COMP_MASK) {
+		rc = ENOTSUP;
+		goto err_qp;
+	}
+
+	if (ex->qp_type == IBV_QPT_RC) {
+		if (!check_comp_mask(ex->comp_mask,
+				     IONIC_QP_SUPPORTED_COMP_MASK_RC)) {
+			rc = ENOTSUP;
+			goto err_qp;
+		}
+	} else if (ex->qp_type == IBV_QPT_UD) {
+		if (!check_comp_mask(ex->comp_mask,
+				     IONIC_QP_SUPPORTED_COMP_MASK_UD)) {
+			rc = ENOTSUP;
+			goto err_qp;
+		}
+	} else {
+		rc = ENOTSUP;
+		goto err_qp;
+	}
+
+	if (!check_comp_mask(ex->send_ops_flags,
+			     IONIC_QP_SUPPORTED_SEND_OPS_FLAGS)) {
+		rc = ENOTSUP;
+		goto err_qp;
+	}
 
 	qp = calloc(1, sizeof(*qp));
 	if (!qp) {
@@ -1832,6 +2141,31 @@ static struct ibv_qp *ionic_create_qp_ex(struct ibv_context *ibctx,
 			ionic_v1_recv_wqe_max_sge(qp->rq.queue.stride_log2, qp->rq.spec,
 						  qp->rq.cmb & IONIC_CMB_EXPDB);
 	}
+
+	/* management of the critical section */
+	qp->vqp.qp_ex.wr_start = ionic_wr_start;
+	qp->vqp.qp_ex.wr_abort = ionic_wr_abort;
+	qp->vqp.qp_ex.wr_complete = ionic_wr_complete;
+
+	/* setters cause wqe to be posted without doorbell */
+	qp->vqp.qp_ex.wr_set_sge_list = ionic_wr_set_sge_list;
+	qp->vqp.qp_ex.wr_set_sge = ionic_wr_set_sge;
+	qp->vqp.qp_ex.wr_set_inline_data_list = ionic_wr_set_inline_data_list;
+	qp->vqp.qp_ex.wr_set_inline_data = ionic_wr_set_inline_data;
+
+	/* builders supply opcode for the wqe to be posted by setters */
+	qp->vqp.qp_ex.wr_send = ionic_wr_send;
+	qp->vqp.qp_ex.wr_send_imm = ionic_wr_send_imm;
+	qp->vqp.qp_ex.wr_send_inv = ionic_wr_send_inv;
+	qp->vqp.qp_ex.wr_rdma_write = ionic_wr_rdma_write;
+	qp->vqp.qp_ex.wr_rdma_write_imm = ionic_wr_rdma_write_imm;
+	qp->vqp.qp_ex.wr_rdma_read = ionic_wr_rdma_read;
+	qp->vqp.qp_ex.wr_atomic_cmp_swp = ionic_wr_atomic_cmp_swp;
+	qp->vqp.qp_ex.wr_atomic_fetch_add = ionic_wr_atomic_fetch_add;
+	qp->vqp.qp_ex.wr_bind_mw = ionic_wr_bind_mw;
+	qp->vqp.qp_ex.wr_local_inv = ionic_wr_local_inv;
+
+	qp->vqp.comp_mask = VERBS_QP_EX;
 
 	return &qp->vqp.qp;
 
