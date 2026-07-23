@@ -94,7 +94,9 @@ struct irdma_create_srq_resp {
 struct irdma_create_qp_req {
 	__aligned_u64 user_wqe_bufs;
 	__aligned_u64 user_compl_ctx;
+	// out-of-tree drivers expect a comp-mask field
 	__aligned_u64 comp_mask;
+	__aligned_u64 legacy_dontuse;
 };
 
 struct irdma_mem_reg_req {
