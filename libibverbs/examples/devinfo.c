@@ -390,12 +390,15 @@ static void print_device_cap_flags_ex(uint64_t device_cap_flags_ex)
 {
 	uint64_t ex_flags = device_cap_flags_ex & 0xffffffff00000000ULL;
 	uint64_t unknown_flags = ~(IBV_DEVICE_RAW_SCATTER_FCS |
-				   IBV_DEVICE_PCI_WRITE_END_PADDING);
+				   IBV_DEVICE_PCI_WRITE_END_PADDING |
+				   IBV_DEVICE_CC_DMA_BOUNCE);
 
 	if (ex_flags & IBV_DEVICE_RAW_SCATTER_FCS)
 		printf("\t\t\t\t\tRAW_SCATTER_FCS\n");
 	if (ex_flags & IBV_DEVICE_PCI_WRITE_END_PADDING)
 		printf("\t\t\t\t\tPCI_WRITE_END_PADDING\n");
+	if (ex_flags & IBV_DEVICE_CC_DMA_BOUNCE)
+		printf("\t\t\t\t\tCC_DMA_BOUNCE\n");
 	if (ex_flags & unknown_flags)
 		printf("\t\t\t\t\tUnknown flags: 0x%" PRIX64 "\n",
 		       ex_flags & unknown_flags);
@@ -504,11 +507,30 @@ static void print_raw_packet_caps(uint32_t raw_packet_caps)
 		printf("\t\t\t\t\tDelay drop\n");
 }
 
+static void print_comp_cntr_attach_ops(uint32_t ops)
+{
+	printf("\tcomp_cntr_caps:\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_SEND)
+		printf("\t\t\t\t\tQP_ATTACH_SEND\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_RECV)
+		printf("\t\t\t\t\tQP_ATTACH_RECV\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_READ)
+		printf("\t\t\t\t\tQP_ATTACH_RDMA_READ\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_READ)
+		printf("\t\t\t\t\tQP_ATTACH_REMOTE_RDMA_READ\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_RDMA_WRITE)
+		printf("\t\t\t\t\tQP_ATTACH_RDMA_WRITE\n");
+	if (ops & IBV_QP_ATTACH_COMP_CNTR_OP_REMOTE_RDMA_WRITE)
+		printf("\t\t\t\t\tQP_ATTACH_REMOTE_RDMA_WRITE\n");
+}
+
 static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 {
 	struct ibv_context *ctx;
 	struct ibv_device_attr_ex device_attr = {};
+	struct ibv_comp_cntr_caps cc_caps = {};
 	struct ibv_port_attr port_attr;
+	uint64_t port_speed;
 	int rc = 0;
 	uint32_t port;
 	char buf[256];
@@ -588,6 +610,10 @@ static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 			printf("\tmax_srq_sge:\t\t\t%d\n", device_attr.orig_attr.max_srq_sge);
 		}
 		printf("\tmax_pkeys:\t\t\t%d\n", device_attr.orig_attr.max_pkeys);
+		if (!ibv_query_comp_cntr_caps(ctx, &cc_caps)) {
+			printf("\tmax_comp_cntr:\t\t\t%d\n", cc_caps.max_counters);
+			print_comp_cntr_attach_ops(cc_caps.supported_qp_attach_ops);
+		}
 		printf("\tlocal_ca_ack_delay:\t\t%d\n", device_attr.orig_attr.local_ca_ack_delay);
 
 		print_odp_caps(&device_attr);
@@ -664,6 +690,11 @@ static int print_hca_cap(struct ibv_device *ib_dev, uint8_t ib_port)
 							   speed_str(port_attr.active_speed),
 			       port_attr.active_speed_ex ? port_attr.active_speed_ex :
 							   port_attr.active_speed);
+			rc = ibv_query_port_speed(ctx, port, &port_speed);
+			/* effective_speed is shown only if the verb is supported and succeeded */
+			if (!rc)
+				printf("\t\t\teffective_speed:\t%.1f Gbps\n",
+				       port_speed / 10.0);
 			if (ib_dev->transport_type == IBV_TRANSPORT_IB)
 				printf("\t\t\tphys_state:\t\t%s (%d)\n",
 				       port_phy_state_str(port_attr.phys_state), port_attr.phys_state);

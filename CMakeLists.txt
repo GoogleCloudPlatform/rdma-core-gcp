@@ -84,11 +84,11 @@ endif()
 set(PACKAGE_NAME "RDMA")
 
 # See Documentation/versioning.md
-set(PACKAGE_VERSION "64.0")
+set(PACKAGE_VERSION "65.0")
 # When this is changed the values in these files need changing too:
 #   debian/control
 #   debian/libibverbs1.symbols
-set(IBVERBS_PABI_VERSION "59")
+set(IBVERBS_PABI_VERSION "65")
 set(IBVERBS_PROVIDER_SUFFIX "-rdmav${IBVERBS_PABI_VERSION}.so")
 
 #-------------------------
@@ -467,9 +467,17 @@ int main(void) {
   return 0;
 }
 " RDMA_PRELOAD_LIBC_HAS_FCNTL64_SENDFILE64)
+CHECK_C_SOURCE_COMPILES("
+#include <fcntl.h>
+int fcntl(int, int, ...) { return 0; }
+int fcntl64(int, int, ...) { return 0; }
+int main(void) {
+  return 0;
+}
+" RDMA_PRELOAD_LIBC_SYMS_LFS_NOT_ALIAS)
 set(CMAKE_REQUIRED_DEFINITIONS "${SAFE_CMAKE_REQUIRED_DEFINITIONS}")
 set(CMAKE_REQUIRED_QUIET 0)
-if(RDMA_PRELOAD_LIBC_HAS_FCNTL64_SENDFILE64)
+if(RDMA_PRELOAD_LIBC_HAS_FCNTL64_SENDFILE64 AND RDMA_PRELOAD_LIBC_SYMS_LFS_NOT_ALIAS)
   set(RDMA_PRELOAD_HAVE_LFS_WRAPPER_SYMS 1)
 else()
   set(RDMA_PRELOAD_HAVE_LFS_WRAPPER_SYMS 0)
@@ -498,6 +506,8 @@ if (NOT HAVE_SPARSE)
   CHECK_INCLUDE_FILE("stdatomic.h" HAVE_STDATOMIC)
   RDMA_DoFixup("${HAVE_STDATOMIC}" "stdatomic.h")
 endif()
+
+CHECK_INCLUDE_FILE("linux/dma-heap.h" HAVE_LINUX_DMA_HEAP_H)
 
 RDMA_Check_SSE(HAVE_TARGET_SSE)
 RDMA_Check_LS64(HAVE_LS64)
@@ -801,6 +811,7 @@ add_subdirectory(providers/erdma)
 add_subdirectory(providers/hns)
 add_subdirectory(providers/hns/man)
 add_subdirectory(providers/ionic)
+add_subdirectory(providers/ionic/man)
 add_subdirectory(providers/irdma)
 add_subdirectory(providers/mana)
 add_subdirectory(providers/mana/man)

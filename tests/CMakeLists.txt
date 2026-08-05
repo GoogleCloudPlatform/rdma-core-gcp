@@ -14,6 +14,7 @@ rdma_python_test(tests
   rdmacm_utils.py
   test_addr.py
   test_atomic.py
+  test_buf.py
   test_cq.py
   test_cq_events.py
   test_cqex.py
@@ -54,6 +55,7 @@ rdma_python_test(tests
   test_odp.py
   test_pd.py
   test_parent_domain.py
+  test_phc_timestamp.py
   test_qp.py
   test_qpex.py
   test_rdmacm.py

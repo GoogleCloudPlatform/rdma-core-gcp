@@ -45,6 +45,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <netinet/tcp.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <search.h>
@@ -68,11 +70,17 @@
 #define RS_QP_CTRL_SIZE 4	/* must be power of 2 */
 #define RS_CONN_RETRIES 6
 #define RS_SGL_SIZE 2
+#define REPOLL_INIT_FD_CAP 1024
+#define REPOLL_FD_GROW_STEP 1024
+#define FD_EPOLL 64
+
 static struct index_map idm;
 static pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t svc_mut = PTHREAD_MUTEX_INITIALIZER;
 
 struct rsocket;
+
+static int repoll_close(int epfd);
 
 enum {
 	RS_SVC_NOOP,
@@ -317,7 +325,7 @@ struct ds_qp {
 };
 
 struct rsocket {
-	int		  type;  /* SOCK_STREAM or SOCK_DGRAM only; flags in fd_flags/fs_flags */
+	int		  type;  /* SOCK_STREAM or SOCK_DGRAM; must be first */
 	int		  index;
 	fastlock_t	  slock;
 	fastlock_t	  rlock;
@@ -429,6 +437,27 @@ struct ds_udp_header {
 #define DS_UDP_IPV6_HDR_LEN 28
 
 #define ds_next_qp(qp) container_of((qp)->list.next, struct ds_qp, list)
+
+struct repoll_info {
+	int type; /* FD_EPOLL; must be first */
+	int epfd;
+	int epfd_peer;
+	int event_fd;
+	pthread_t monitor;
+	pthread_mutex_t lock;
+	pthread_cond_t monitor_cond;
+	pthread_cond_t wait_cond;
+	struct index_map fd_to_slot;
+	struct pollfd *fds;
+	union epoll_data *user_data;
+	uint16_t slot_count;
+	uint16_t capacity;
+	uint64_t monitor_seq;
+	uint64_t wait_seq;
+	uint64_t snapshot;
+	unsigned int waiters;
+	bool running;
+};
 
 static void write_all(int fd, const void *msg, size_t len)
 {
@@ -1241,12 +1270,19 @@ err:
 	return ret;
 }
 
+static struct rsocket *rs_lookup(int socket)
+{
+	struct rsocket *rs = idm_lookup(&idm, socket);
+
+	return (rs && rs->type == FD_EPOLL) ? NULL : rs;
+}
+
 int rbind(int socket, const struct sockaddr *addr, socklen_t addrlen)
 {
 	struct rsocket *rs;
 	int ret;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->type == SOCK_STREAM) {
@@ -1269,7 +1305,7 @@ int rlisten(int socket, int backlog)
 	struct rsocket *rs;
 	int ret;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 
@@ -1362,7 +1398,7 @@ int raccept(int socket, struct sockaddr *addr, socklen_t *addrlen)
 	struct rsocket *rs, *new_rs;
 	int ret;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 
@@ -1727,7 +1763,7 @@ int rconnect(int socket, const struct sockaddr *addr, socklen_t addrlen)
 	struct rsocket *rs;
 	int ret, save_errno;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->type == SOCK_STREAM) {
@@ -3498,7 +3534,7 @@ int rshutdown(int socket, int how)
 	struct rsocket *rs;
 	int ctrl, ret = 0;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->opts & RS_OPT_KEEPALIVE)
@@ -3571,6 +3607,8 @@ int rclose(int socket)
 	rs = idm_lookup(&idm, socket);
 	if (!rs)
 		return EBADF;
+	if (rs->type == FD_EPOLL)
+		return repoll_close(socket);
 	if (rs->type == SOCK_STREAM) {
 		if (rs->state & rs_connected)
 			rshutdown(socket, SHUT_RDWR);
@@ -3580,8 +3618,10 @@ int rclose(int socket)
 			rs_notify_svc(&listen_svc, rs, RS_SVC_REM_CM);
 		if (rs->opts & RS_OPT_CM_SVC)
 			rs_notify_svc(&connect_svc, rs, RS_SVC_REM_CM);
-	} else {
+	} else if (rs->type == SOCK_DGRAM) {
 		ds_shutdown(rs);
+	} else {
+		return EBADF;
 	}
 
 	rs_free(rs);
@@ -3606,7 +3646,7 @@ int rgetpeername(int socket, struct sockaddr *addr, socklen_t *addrlen)
 {
 	struct rsocket *rs;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->type == SOCK_STREAM) {
@@ -3621,7 +3661,7 @@ int rgetsockname(int socket, struct sockaddr *addr, socklen_t *addrlen)
 {
 	struct rsocket *rs;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if (rs->type == SOCK_STREAM) {
@@ -3667,7 +3707,7 @@ int rsetsockopt(int socket, int level, int optname,
 	uint64_t *opts = NULL;
 
 	ret = ERR(ENOTSUP);
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	if ((rs->type == SOCK_DGRAM) && level != SOL_RDMA) {
@@ -3865,7 +3905,7 @@ int rgetsockopt(int socket, int level, int optname,
 	int ret = 0;
 	int num_paths;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	switch (level) {
@@ -4033,7 +4073,7 @@ int rfcntl(int socket, int cmd, ... /* arg */ )
 	int param;
 	int ret = 0;
 
-	rs = idm_lookup(&idm, socket);
+	rs = rs_lookup(socket);
 	if (!rs)
 		return ERR(EBADF);
 	va_start(args, cmd);
@@ -4672,6 +4712,9 @@ static void rs_handle_cm_event(struct rsocket *rs)
 {
 	int ret;
 
+	if (!rs->cm_id)
+		return;
+
 	if (rs->state & rs_opening) {
 		rs_do_connect(rs);
 	} else {
@@ -4742,6 +4785,7 @@ static void *cm_svc_run(void *arg)
 			cm_svc_process_sock(svc);
 			/* svc->contexts may have been reallocated, so need to assign again */
 			fds = svc->contexts;
+			continue;
 		}
 
 		for (i = 1; i <= svc->cnt; i++) {
@@ -4756,4 +4800,569 @@ static void *cm_svc_run(void *arg)
 	} while (svc->cnt >= 1);
 
 	return NULL;
+}
+
+static inline int repoll_fd_slot(struct index_map *fd_to_slot, int fd)
+{
+	void *slot = idm_lookup(fd_to_slot, fd);
+
+	return slot ? (int)(uintptr_t)slot : -1;
+}
+
+static inline int repoll_fd_to_slot_set(struct index_map *fd_to_slot, int fd,
+					int slot)
+{
+	return idm_set(fd_to_slot, fd, (void *)(uintptr_t)slot);
+}
+
+static struct repoll_info *repoll_lookup(int epfd)
+{
+	struct repoll_info *ri;
+
+	ri = idm_lookup(&idm, epfd);
+	if (!ri || ri->type != FD_EPOLL)
+		return NULL;
+	return ri;
+}
+
+static void repoll_wake_monitor(struct repoll_info *ri)
+{
+	uint64_t val = 1;
+
+	if (write(ri->event_fd, &val, sizeof(val)) != sizeof(val))
+		return;
+}
+
+static int repoll_close(int epfd)
+{
+	struct repoll_info *ri;
+
+	ri = repoll_lookup(epfd);
+	if (!ri)
+		return EBADF;
+	if (ri->slot_count > 1)
+		return EBUSY;
+
+	ri->running = false;
+	pthread_mutex_lock(&ri->lock);
+	pthread_cond_broadcast(&ri->monitor_cond);
+	pthread_cond_broadcast(&ri->wait_cond);
+	pthread_mutex_unlock(&ri->lock);
+	repoll_wake_monitor(ri);
+	pthread_join(ri->monitor, NULL);
+
+	pthread_mutex_lock(&mut);
+	idm_clear(&idm, epfd);
+	pthread_mutex_unlock(&mut);
+
+	close(ri->event_fd);
+	close(ri->epfd);
+	close(ri->epfd_peer);
+	pthread_mutex_destroy(&ri->lock);
+	pthread_cond_destroy(&ri->monitor_cond);
+	pthread_cond_destroy(&ri->wait_cond);
+	free(ri->fds);
+	free(ri->user_data);
+	free(ri);
+	return 0;
+}
+
+static int repoll_monitor_refresh_fds(struct repoll_info *ri,
+				      struct pollfd **fds, int *fds_cap,
+				      int *nfds)
+{
+	struct pollfd *new_fds;
+
+	if (*fds_cap < ri->capacity) {
+		new_fds = realloc(*fds, sizeof(**fds) * ri->capacity);
+		if (!new_fds)
+			return -1;
+		*fds = new_fds;
+		*fds_cap = ri->capacity;
+	}
+	memcpy(*fds, ri->fds, sizeof(**fds) * ri->slot_count);
+	*nfds = ri->slot_count;
+	return 0;
+}
+
+static int repoll_monitor_has_user_events(struct pollfd *fds, int nfds)
+{
+	for (int i = 1; i < nfds; ++i) {
+		if (fds[i].fd > 0 && fds[i].revents)
+			return 1;
+	}
+	return 0;
+}
+
+static bool repoll_monitor_drain_event(struct pollfd *fds)
+{
+	uint64_t val;
+
+	if (!(fds[0].revents & POLLIN))
+		return false;
+	if (read(fds[0].fd, &val, sizeof(val)) != sizeof(val))
+		return true;
+	return true;
+}
+
+static void *repoll_monitor_fn(void *arg)
+{
+	struct repoll_info *ri = arg;
+	struct pollfd *fds = NULL;
+	int fds_cap = 0;
+	int nfds = 0;
+	uint64_t my_monitor_seq = 0;
+	uint64_t my_snapshot = 0;
+
+	pthread_mutex_lock(&ri->lock);
+	while (ri->running) {
+		while (ri->running && ri->monitor_seq == my_monitor_seq)
+			pthread_cond_wait(&ri->monitor_cond, &ri->lock);
+
+		if (!ri->running)
+			break;
+
+		my_monitor_seq = ri->monitor_seq;
+		pthread_mutex_unlock(&ri->lock);
+
+		for (;;) {
+			unsigned int wait_cnt;
+			int refresh_ret = 0;
+
+			pthread_mutex_lock(&ri->lock);
+			wait_cnt = ri->waiters;
+			if (wait_cnt && my_snapshot != ri->snapshot) {
+				refresh_ret = repoll_monitor_refresh_fds(
+						ri, &fds, &fds_cap, &nfds);
+				if (!refresh_ret)
+					my_snapshot = ri->snapshot;
+			}
+			pthread_mutex_unlock(&ri->lock);
+			if (!wait_cnt)
+				break;
+			if (refresh_ret)
+				goto out;
+
+			if (rpoll(fds, nfds, -1) <= 0)
+				continue;
+
+			if (repoll_monitor_drain_event(fds)) {
+				if (!ri->running)
+					goto out;
+				continue;
+			}
+
+			if (repoll_monitor_has_user_events(fds, nfds)) {
+				pthread_mutex_lock(&ri->lock);
+				my_monitor_seq = ri->monitor_seq;
+				ri->wait_seq++;
+				pthread_cond_broadcast(&ri->wait_cond);
+				pthread_mutex_unlock(&ri->lock);
+				break;
+			}
+		}
+
+		pthread_mutex_lock(&ri->lock);
+	}
+
+	pthread_mutex_unlock(&ri->lock);
+out:
+	free(fds);
+	return NULL;
+}
+
+static int repoll_alloc_fd_arrays(struct repoll_info *ri)
+{
+	ri->capacity = REPOLL_INIT_FD_CAP;
+
+	ri->fds = malloc(sizeof(*ri->fds) * ri->capacity);
+	if (!ri->fds)
+		return -1;
+	for (int i = 0; i < ri->capacity; ++i)
+		ri->fds[i].fd = -1;
+
+	ri->user_data = malloc(sizeof(*ri->user_data) * ri->capacity);
+	if (!ri->user_data) {
+		free(ri->fds);
+		return -1;
+	}
+	return 0;
+}
+
+static int repoll_setup_event_fd(struct repoll_info *ri)
+{
+	ri->event_fd = eventfd(0, EFD_NONBLOCK);
+	if (ri->event_fd == -1)
+		return -1;
+
+	ri->fds[0].fd = ri->event_fd;
+	ri->fds[0].events = POLLIN;
+	ri->fds[0].revents = 0;
+	ri->slot_count = 1;
+	ri->snapshot = 1;
+	return 0;
+}
+
+static int repoll_start_monitor(struct repoll_info *ri)
+{
+	int ret;
+
+	ri->running = true;
+	ret = pthread_create(&ri->monitor, NULL, repoll_monitor_fn, ri);
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
+int repoll_create(int flags)
+{
+	struct repoll_info *ri;
+	pthread_condattr_t cond_attr;
+	int pipefd[2];
+	int ret;
+
+	ri = calloc(1, sizeof(*ri));
+	if (!ri)
+		return ERR(ENOMEM);
+
+	if (repoll_alloc_fd_arrays(ri))
+		goto fail_fds;
+
+	ret = pipe2(pipefd, O_DIRECT | (flags & (O_CLOEXEC | O_NONBLOCK)));
+	if (ret == -1)
+		goto fail_pipe;
+
+	ri->type = FD_EPOLL;
+	ri->epfd = pipefd[0];
+	ri->epfd_peer = pipefd[1];
+	pthread_mutex_init(&ri->lock, NULL);
+	pthread_condattr_init(&cond_attr);
+	pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+	pthread_cond_init(&ri->monitor_cond, &cond_attr);
+	pthread_cond_init(&ri->wait_cond, &cond_attr);
+	pthread_condattr_destroy(&cond_attr);
+
+	if (repoll_setup_event_fd(ri))
+		goto fail_comm;
+
+	pthread_mutex_lock(&mut);
+	ret = idm_set(&idm, ri->epfd, ri);
+	pthread_mutex_unlock(&mut);
+	if (ret < 0)
+		goto fail_thread;
+
+	if (repoll_start_monitor(ri))
+		goto fail_monitor;
+
+	return ri->epfd;
+
+fail_monitor:
+	pthread_mutex_lock(&mut);
+	idm_clear(&idm, ri->epfd);
+	pthread_mutex_unlock(&mut);
+fail_thread:
+	close(ri->event_fd);
+fail_comm:
+	close(ri->epfd);
+	close(ri->epfd_peer);
+fail_pipe:
+	free(ri->user_data);
+	free(ri->fds);
+fail_fds:
+	free(ri);
+	return -1;
+}
+
+static uint32_t epoll_to_poll_events(uint32_t epoll_events)
+{
+	uint32_t poll_events = 0;
+
+	if (epoll_events & EPOLLIN)
+		poll_events |= POLLIN;
+	if (epoll_events & EPOLLOUT)
+		poll_events |= POLLOUT;
+	if (epoll_events & EPOLLERR)
+		poll_events |= POLLERR;
+	if (epoll_events & EPOLLHUP)
+		poll_events |= POLLHUP;
+	return poll_events;
+}
+
+static int repoll_grow_fds(struct repoll_info *ri)
+{
+	struct pollfd *new_fds;
+	union epoll_data *new_data;
+	int new_max = ri->capacity + REPOLL_FD_GROW_STEP;
+
+	new_fds = calloc(new_max, sizeof(*new_fds));
+	if (!new_fds)
+		return -ENOMEM;
+	memcpy(new_fds, ri->fds, sizeof(*new_fds) * ri->capacity);
+	for (int i = ri->capacity; i < new_max; ++i)
+		new_fds[i].fd = -1;
+	free(ri->fds);
+	ri->fds = new_fds;
+
+	new_data = calloc(new_max, sizeof(*new_data));
+	if (!new_data)
+		return -ENOMEM;
+	memcpy(new_data, ri->user_data, sizeof(*new_data) * ri->capacity);
+	free(ri->user_data);
+	ri->user_data = new_data;
+
+	ri->capacity = new_max;
+	return 0;
+}
+
+static void repoll_send_reload(struct repoll_info *ri)
+{
+	if (!ri->running)
+		return;
+
+	repoll_wake_monitor(ri);
+}
+
+static int repoll_ctl_add(struct repoll_info *ri, int fd,
+			  struct epoll_event *event)
+{
+	int slot;
+
+	if (repoll_fd_slot(&ri->fd_to_slot, fd) >= 0)
+		return EEXIST;
+
+	if (ri->slot_count >= ri->capacity) {
+		if (repoll_grow_fds(ri))
+			return ENOMEM;
+	}
+	slot = ri->slot_count;
+
+	if (repoll_fd_to_slot_set(&ri->fd_to_slot, fd, slot) < 0)
+		return ENOMEM;
+
+	ri->fds[slot].fd = fd;
+	ri->fds[slot].events = epoll_to_poll_events(event->events);
+	ri->fds[slot].revents = 0;
+	memcpy(&ri->user_data[slot], &event->data, sizeof(event->data));
+	ri->slot_count++;
+	return 0;
+}
+
+static int repoll_ctl_mod(struct repoll_info *ri, int fd,
+			  struct epoll_event *event)
+{
+	int slot = repoll_fd_slot(&ri->fd_to_slot, fd);
+
+	if (slot < 0)
+		return ENOENT;
+
+	ri->fds[slot].fd = fd;
+	ri->fds[slot].events = epoll_to_poll_events(event->events);
+	ri->fds[slot].revents = 0;
+	memcpy(&ri->user_data[slot], &event->data, sizeof(event->data));
+	return 0;
+}
+
+static int repoll_ctl_del(struct repoll_info *ri, int fd)
+{
+	int moved_fd = -1;
+	int slot;
+	int last;
+
+	slot = repoll_fd_slot(&ri->fd_to_slot, fd);
+	if (slot < 0)
+		return ENOENT;
+	last = ri->slot_count - 1;
+
+	if (slot != last) {
+		moved_fd = ri->fds[last].fd;
+		assert(repoll_fd_slot(&ri->fd_to_slot, moved_fd) >= 0);
+	}
+
+	idm_clear(&ri->fd_to_slot, fd);
+	if (slot != last) {
+		ri->fds[slot] = ri->fds[last];
+		ri->user_data[slot] = ri->user_data[last];
+		if (repoll_fd_to_slot_set(&ri->fd_to_slot, moved_fd, slot) < 0)
+			return ENOMEM;
+	}
+	ri->fds[last].fd = -1;
+	ri->fds[last].events = 0;
+	ri->fds[last].revents = 0;
+	memset(&ri->user_data[last], 0, sizeof(ri->user_data[last]));
+	ri->slot_count--;
+	return 0;
+}
+
+int repoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+{
+	struct repoll_info *ri;
+	int ret;
+
+	if (fd < 0)
+		return EBADF;
+	if (epfd == fd)
+		return EINVAL;
+
+	ri = repoll_lookup(epfd);
+	if (!ri)
+		return EINVAL;
+
+	pthread_mutex_lock(&ri->lock);
+
+	switch (op) {
+	case EPOLL_CTL_ADD:
+		ret = repoll_ctl_add(ri, fd, event);
+		break;
+	case EPOLL_CTL_MOD:
+		ret = repoll_ctl_mod(ri, fd, event);
+		break;
+	case EPOLL_CTL_DEL:
+		ret = repoll_ctl_del(ri, fd);
+		break;
+	default:
+		ret = EINVAL;
+	}
+
+	if (!ret) {
+		ri->snapshot++;
+		repoll_send_reload(ri);
+	}
+	pthread_mutex_unlock(&ri->lock);
+	return ret;
+}
+
+static uint32_t poll_to_epoll_events(uint32_t poll_revents)
+{
+	uint32_t epoll_events = 0;
+
+	if (poll_revents & POLLIN)
+		epoll_events |= EPOLLIN;
+	if (poll_revents & POLLOUT)
+		epoll_events |= EPOLLOUT;
+	if (poll_revents & POLLERR)
+		epoll_events |= EPOLLERR;
+	if (poll_revents & POLLHUP)
+		epoll_events |= EPOLLHUP;
+	return epoll_events;
+}
+
+static int repoll_timeout_to_abs_ts(int timeout, struct timespec *abs_timeout)
+{
+	struct timespec now;
+	long timeout_nsec;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return -1;
+
+	abs_timeout->tv_sec = now.tv_sec + timeout / 1000;
+	timeout_nsec = (timeout % 1000) * 1000000L;
+	abs_timeout->tv_nsec = now.tv_nsec + timeout_nsec;
+	if (abs_timeout->tv_nsec >= 1000000000L) {
+		abs_timeout->tv_sec++;
+		abs_timeout->tv_nsec -= 1000000000L;
+	}
+	return 0;
+}
+
+static int repoll_collect_events(struct repoll_info *ri,
+				 struct pollfd *polled_fds, int polled_nfds,
+				 struct epoll_event *events, int maxevents)
+{
+	int event_cnt = 0;
+	int slot;
+	int i;
+
+	for (i = 0; i < polled_nfds && i < ri->slot_count - 1; ++i) {
+		slot = i + 1;
+
+		if (polled_fds[i].revents &&
+		    ri->fds[slot].fd == polled_fds[i].fd) {
+			events[event_cnt].data = ri->user_data[slot];
+			events[event_cnt].events =
+				poll_to_epoll_events(polled_fds[i].revents);
+			if (++event_cnt >= maxevents)
+				break;
+		}
+	}
+	return event_cnt;
+}
+
+int repoll_wait(int epfd, struct epoll_event *events, int maxevents,
+		int timeout)
+{
+	struct repoll_info *ri;
+	struct timespec abs_timeout;
+	struct timespec now;
+	uint64_t my_wait_seq;
+	int nfds, ret;
+	int wait_ret = 0;
+	bool have_deadline = false;
+
+	ri = repoll_lookup(epfd);
+	if (!ri)
+		return EINVAL;
+
+	if (timeout > 0) {
+		if (repoll_timeout_to_abs_ts(timeout, &abs_timeout))
+			return errno ? errno : EINVAL;
+		have_deadline = true;
+	}
+
+	do {
+		pthread_mutex_lock(&ri->lock);
+		nfds = ri->slot_count - 1;
+		if (nfds > 0) {
+			ret = rpoll(ri->fds + 1, nfds, 0);
+			if (ret > 0) {
+				ret = repoll_collect_events(ri, ri->fds + 1,
+							    nfds, events,
+							    maxevents);
+				pthread_mutex_unlock(&ri->lock);
+				return ret;
+			}
+		}
+
+		if (!timeout) {
+			pthread_mutex_unlock(&ri->lock);
+			return 0;
+		}
+
+		ri->waiters++;
+		ri->monitor_seq++;
+		pthread_cond_signal(&ri->monitor_cond);
+
+		my_wait_seq = ri->wait_seq;
+		while (my_wait_seq == ri->wait_seq && ri->running) {
+			if (have_deadline) {
+				if (clock_gettime(CLOCK_MONOTONIC, &now))
+					wait_ret = errno;
+				else if (now.tv_sec > abs_timeout.tv_sec ||
+					 (now.tv_sec == abs_timeout.tv_sec &&
+					  now.tv_nsec >= abs_timeout.tv_nsec))
+					wait_ret = ETIMEDOUT;
+				else
+					wait_ret = pthread_cond_timedwait(
+							&ri->wait_cond,
+							&ri->lock,
+							&abs_timeout);
+			} else {
+				wait_ret = pthread_cond_wait(&ri->wait_cond,
+							     &ri->lock);
+			}
+
+			if (wait_ret)
+				break;
+		}
+
+		ri->waiters--;
+		pthread_mutex_unlock(&ri->lock);
+
+		if (wait_ret == ETIMEDOUT)
+			return 0;
+		if (wait_ret)
+			return wait_ret;
+		if (!ri->running)
+			return 0;
+	} while (1);
 }

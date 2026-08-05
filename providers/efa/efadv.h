@@ -23,6 +23,7 @@ enum {
 	EFADV_DEVICE_ATTR_CAPS_RDMA_WRITE = 1 << 3,
 	EFADV_DEVICE_ATTR_CAPS_UNSOLICITED_WRITE_RECV = 1 << 4,
 	EFADV_DEVICE_ATTR_CAPS_CQ_WITH_EXT_MEM_DMABUF = 1 << 5,
+	EFADV_DEVICE_ATTR_CAPS_COMP_CNTR = 1 << 6,
 };
 
 struct efadv_device_attr {
@@ -105,6 +106,10 @@ struct ibv_qp *efadv_create_qp_ex(struct ibv_context *ibvctx,
 				  struct efadv_qp_init_attr *efa_attr,
 				  uint32_t inlen);
 
+enum {
+	EFADV_WQ_CAPS_64_BIT_REQ_ID = 1 << 0,
+};
+
 struct efadv_wq_attr {
 	uint64_t comp_mask;
 	uint8_t *buffer;
@@ -112,7 +117,8 @@ struct efadv_wq_attr {
 	uint32_t num_entries;
 	uint32_t *doorbell;
 	uint32_t max_batch;
-	uint8_t reserved[4];
+	uint16_t caps;
+	uint8_t reserved[2];
 };
 
 int efadv_query_qp_wqs(struct ibv_qp *ibvqp, struct efadv_wq_attr *sq_attr,
@@ -189,6 +195,40 @@ static inline bool efadv_wc_is_unsolicited(struct efadv_cq *efadv_cq)
 {
 	return efadv_cq->wc_is_unsolicited(efadv_cq);
 }
+
+enum {
+	EFADV_MEMORY_LOCATION_VA,
+	EFADV_MEMORY_LOCATION_DMABUF,
+};
+
+struct efadv_memory_location {
+	uint8_t *ptr;
+	struct {
+		uint64_t offset;
+		int32_t fd;
+		uint32_t reserved;
+	} dmabuf;
+	uint8_t type;
+	uint8_t reserved[7];
+};
+
+enum {
+	EFADV_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM = 1 << 0,
+	EFADV_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM = 1 << 1,
+};
+
+struct efadv_comp_cntr_init_attr {
+	uint64_t comp_mask;
+	uint32_t flags;
+	uint32_t reserved;
+	struct efadv_memory_location comp_cntr_ext_mem;
+	struct efadv_memory_location err_cntr_ext_mem;
+};
+
+struct ibv_comp_cntr *efadv_create_comp_cntr(struct ibv_context *ibvctx,
+					     struct ibv_comp_cntr_init_attr *attr,
+					     struct efadv_comp_cntr_init_attr *efa_attr,
+					     uint32_t inlen);
 
 enum {
 	EFADV_MR_ATTR_VALIDITY_RECV_IC_ID = 1 << 0,

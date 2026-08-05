@@ -128,12 +128,12 @@ static inline uint8_t get_cqe_l3_hdr_type(struct mlx5_cqe64 *cqe)
 
 static void *get_buf_cqe(struct mlx5_buf *buf, int n, int cqe_sz)
 {
-	return buf->buf + n * cqe_sz;
+	return buf->ibv_buf.addr + n * cqe_sz;
 }
 
 static void *get_cqe(struct mlx5_cq *cq, int n)
 {
-	return cq->active_buf->buf + n * cq->cqe_sz;
+	return cq->active_buf->ibv_buf.addr + n * cq->cqe_sz;
 }
 
 static void *get_sw_cqe(struct mlx5_cq *cq, int n)
@@ -1136,6 +1136,17 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		return ENOENT;
 	}
 
+	if (clock_update) {
+		err = mlx5dv_get_clock_info(ibcq->context, &cq->last_clock_info);
+		if (err) {
+			if (err == EBUSY)
+				--cq->cons_index;
+			if (lock)
+				mlx5_spin_unlock(&cq->lock);
+			return err;
+		}
+	}
+
 	if (stall)
 		cq->flags |= MLX5_CQ_FLAGS_FOUND_CQES;
 
@@ -1151,17 +1162,8 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		}
 
 		cq->flags &= ~(MLX5_CQ_FLAGS_FOUND_CQES);
-
-		goto out;
 	}
 
-	if (clock_update && !err) {
-		err = mlx5dv_get_clock_info(ibcq->context, &cq->last_clock_info);
-		if (lock && err)
-			mlx5_spin_unlock(&cq->lock);
-	}
-
-out:
 	return err;
 }
 
@@ -1946,8 +1948,8 @@ int mlx5_alloc_cq_buf(struct mlx5_context *mctx, struct mlx5_cq *cq,
 	mlx5_get_alloc_type(mctx, cq->parent_domain,
 			    MLX5_CQ_PREFIX, &type, default_type);
 
-	if (type == MLX5_ALLOC_TYPE_CUSTOM) {
-		buf->mparent_domain = to_mparent_domain(cq->parent_domain);
+	if (type == MLX5_ALLOC_TYPE_CUSTOM ||
+	    type == MLX5_ALLOC_TYPE_DMABUF) {
 		buf->req_alignment = dev->page_size;
 		buf->resource_type = MLX5DV_RES_TYPE_CQ;
 	}
@@ -1956,16 +1958,16 @@ int mlx5_alloc_cq_buf(struct mlx5_context *mctx, struct mlx5_cq *cq,
 				      align(nent * cqe_sz, dev->page_size),
 				      dev->page_size,
 				      type,
-				      MLX5_CQ_PREFIX);
+				      MLX5_CQ_PREFIX, cq->parent_domain);
 
 	if (ret)
 		return -1;
 
 	if (buf->type != MLX5_ALLOC_TYPE_CUSTOM)
-		memset(buf->buf, 0, nent * cqe_sz);
+		memset(buf->ibv_buf.addr, 0, nent * cqe_sz);
 
 	for (i = 0; i < nent; ++i) {
-		cqe = buf->buf + i * cqe_sz;
+		cqe = buf->ibv_buf.addr + i * cqe_sz;
 		cqe += cqe_sz == 128 ? 1 : 0;
 		cqe->op_own = MLX5_CQE_INVALID << 4;
 	}

@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 rdma-core (64.0-1) unstable; urgency=medium
+=======
+rdma-core (65.0-1) unstable; urgency=medium
+>>>>>>> c1c5bf1f480312c07ed4d23f0feecf8b5fd73289
 
   * New upstream release.
 

@@ -720,11 +720,12 @@ static int alloc_srq_buf(struct hns_roce_srq *srq)
 	if (ret)
 		goto err_idx_que;
 
-	srq->wrid = calloc(srq->wqe_cnt, sizeof(*srq->wrid));
+	srq->wrid = malloc(srq->wqe_cnt * sizeof(*srq->wrid));
 	if (!srq->wrid) {
 		ret = -ENOMEM;
 		goto err_wqe_buf;
 	}
+	memset(srq->wrid, 0, srq->wqe_cnt * sizeof(*srq->wrid));
 
 	return 0;
 
@@ -1180,11 +1181,13 @@ static int qp_alloc_wqe(struct ibv_qp_cap *cap, struct hns_roce_qp *qp,
 	qp->sq.wrid = malloc(qp->sq.wqe_cnt * sizeof(uint64_t));
 	if (!qp->sq.wrid)
 		return -ENOMEM;
+	memset(qp->sq.wrid, 0, qp->sq.wqe_cnt * sizeof(uint64_t));
 
 	if (qp->rq.wqe_cnt) {
 		qp->rq.wrid = malloc(qp->rq.wqe_cnt * sizeof(uint64_t));
 		if (!qp->rq.wrid)
 			goto err_alloc;
+		memset(qp->rq.wrid, 0, qp->rq.wqe_cnt * sizeof(uint64_t));
 	}
 
 	if (qp->rq_rinl_buf.wqe_cnt) {
@@ -1446,7 +1449,7 @@ static int qp_exec_create_cmd(struct ibv_qp_init_attr_ex *attr,
 
 	ret = ibv_cmd_create_qp_ex2(&ctx->ibv_ctx.context, &qp->verbs_qp, attr,
 				    &cmd_ex.ibv_cmd, sizeof(cmd_ex),
-				    &resp_ex.ibv_resp, sizeof(resp_ex));
+				    &resp_ex.ibv_resp, sizeof(resp_ex), NULL);
 	if (ret) {
 		verbs_err(&ctx->ibv_ctx,
 			  "failed to exec create qp cmd, ret = %d.\n", ret);

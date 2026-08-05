@@ -1,5 +1,6 @@
 rdma_man_pages(
   ibv_advise_mr.3.md
+  ibv_alloc_buf.3.md
   ibv_alloc_dm.3
   ibv_alloc_dmah.3.md
   ibv_alloc_mw.3
@@ -14,6 +15,7 @@ rdma_man_pages(
   ibv_create_ah.3
   ibv_create_ah_from_wc.3
   ibv_create_comp_channel.3
+  ibv_create_comp_cntr.3.md
   ibv_create_counters.3.md
   ibv_create_cq.3
   ibv_create_cq_ex.3
@@ -57,6 +59,8 @@ rdma_man_pages(
   ibv_post_send.3
   ibv_post_srq_ops.3
   ibv_post_srq_recv.3
+  ibv_qp_attach_comp_cntr.3.md
+  ibv_query_comp_cntr_caps.3.md
   ibv_query_device.3
   ibv_query_device_ex.3
   ibv_query_ece.3.md
@@ -86,6 +90,9 @@ rdma_man_pages(
   ibv_xsrq_pingpong.1
   )
 rdma_alias_man_pages(
+  ibv_alloc_buf.3 ibv_free_buf.3
+  ibv_alloc_buf.3 ibv_reg_buf_mr.3
+  ibv_alloc_buf.3 ibv_export_buf_dmabuf_fd.3
   ibv_alloc_dm.3 ibv_free_dm.3
   ibv_alloc_dm.3 ibv_reg_dm_mr.3
   ibv_alloc_dm.3 ibv_memcpy_to_dm.3
@@ -98,6 +105,13 @@ rdma_alias_man_pages(
   ibv_create_ah.3 ibv_destroy_ah.3
   ibv_create_ah_from_wc.3 ibv_init_ah_from_wc.3
   ibv_create_comp_channel.3 ibv_destroy_comp_channel.3
+  ibv_create_comp_cntr.3 ibv_destroy_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_set_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_set_err_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_inc_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_inc_err_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_read_comp_cntr.3
+  ibv_create_comp_cntr.3 ibv_read_err_comp_cntr.3
   ibv_create_counters.3 ibv_destroy_counters.3
   ibv_create_cq.3 ibv_destroy_cq.3
   ibv_create_flow.3 ibv_destroy_flow.3

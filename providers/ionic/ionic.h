@@ -54,7 +54,33 @@ enum {
 	    IBV_WC_EX_WITH_SRC_QP         |
 	    IBV_WC_EX_WITH_SLID           |
 	    IBV_WC_EX_WITH_SL             |
-	    IBV_WC_EX_WITH_DLID_PATH_BITS
+	    IBV_WC_EX_WITH_DLID_PATH_BITS |
+	    IBV_WC_EX_WITH_COMPLETION_TIMESTAMP |
+	    IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK
+};
+
+enum {
+	IONIC_QP_REQUIRED_COMP_MASK =
+		IBV_QP_INIT_ATTR_PD,
+
+	IONIC_QP_SUPPORTED_COMP_MASK_RC =
+		IONIC_QP_REQUIRED_COMP_MASK		|
+		IBV_QP_INIT_ATTR_SEND_OPS_FLAGS,
+
+	IONIC_QP_SUPPORTED_COMP_MASK_UD =
+		IONIC_QP_REQUIRED_COMP_MASK,
+
+	IONIC_QP_SUPPORTED_SEND_OPS_FLAGS =
+		IBV_QP_EX_WITH_RDMA_WRITE		|
+		IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM	|
+		IBV_QP_EX_WITH_SEND			|
+		IBV_QP_EX_WITH_SEND_WITH_IMM		|
+		IBV_QP_EX_WITH_RDMA_READ		|
+		IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP	|
+		IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD	|
+		IBV_QP_EX_WITH_LOCAL_INV		|
+		IBV_QP_EX_WITH_BIND_MW			|
+		IBV_QP_EX_WITH_SEND_WITH_INV,
 };
 
 struct ionic_ctx {
@@ -79,6 +105,7 @@ struct ionic_ctx {
 
 	void			*dbpage_page;
 	uint64_t		*dbpage;
+	struct ib_uverbs_clock_info	*phc_state;
 
 	pthread_mutex_t		mut;
 	struct ionic_tbl_root	qp_tbl;
@@ -86,9 +113,15 @@ struct ionic_ctx {
 	FILE			*dbg_file;
 };
 
+struct ionic_td {
+	struct ibv_td		ibtd;
+	atomic_int		refcount;
+};
+
 struct ionic_pd {
 	struct ibv_pd		ibpd;
 	struct ibv_pd		*root_ibpd;
+	struct ionic_td		*td;
 
 	uint8_t			udma_mask;
 	uint8_t			sq_cmb;
@@ -112,6 +145,7 @@ struct ionic_cq {
 	struct list_head	poll_sq;
 	struct list_head	poll_rq;
 	bool			flush;
+	bool			do_timestamp;
 	struct list_head	flush_sq;
 	struct list_head	flush_rq;
 	struct ionic_queue	q;
@@ -123,6 +157,16 @@ struct ionic_cq {
 	int			reserve_pending;
 	uint16_t		arm_any_prod;
 	uint16_t		arm_sol_prod;
+	uint64_t		phc_tick;
+};
+
+struct ionic_phc {
+	uint64_t		mask;
+	uint64_t		cycles;
+	uint64_t		nsec;
+	uint64_t		frac;
+	uint32_t		mult;
+	uint32_t		shift;
 };
 
 struct ionic_vcq {
@@ -130,11 +174,16 @@ struct ionic_vcq {
 	struct ionic_cq		cq[2];
 	uint8_t			udma_mask;
 	uint8_t			poll_idx;
+	bool			phc_update;
+	bool			cur_wc_pending;
 	struct ibv_wc		cur_wc; /* for use with start_poll/next_poll */
+	uint64_t		cur_wc_timestamp;
+	struct ionic_phc	phc;
 };
 
 struct ionic_sq_meta {
 	uint64_t		wrid;
+	uint64_t		cqe_timestamp;
 	uint32_t		len;
 	uint16_t		seq;
 	uint8_t			ibop;
@@ -201,6 +250,8 @@ struct ionic_qp {
 
 	struct ionic_sq		sq;
 	struct ionic_rq		rq;
+	struct ibv_send_wr	ex_wr;
+	int			ex_rc;
 	bool			sig_all;
 };
 
@@ -246,6 +297,16 @@ static inline struct ionic_pd *to_ionic_pd(struct ibv_pd *ibpd)
 	return container_of(ibpd, struct ionic_pd, ibpd);
 }
 
+static inline struct ionic_td *to_ionic_td(struct ibv_td *ibtd)
+{
+	return container_of(ibtd, struct ionic_td, ibtd);
+}
+
+static inline bool ionic_pd_lockfree(struct ibv_pd *ibpd)
+{
+	return to_ionic_pd(ibpd)->td;
+}
+
 static inline struct ibv_pd *ionic_root_ibpd(struct ionic_pd *pd)
 {
 	return pd->root_ibpd;
@@ -275,6 +336,11 @@ static inline struct ionic_cq *to_ionic_vcq_cq(struct ibv_cq *ibcq,
 static inline struct ionic_qp *to_ionic_qp(struct ibv_qp *ibqp)
 {
 	return container_of(ibqp, struct ionic_qp, vqp.qp);
+}
+
+static inline struct ionic_qp *to_ionic_qp_ex(struct ibv_qp_ex *ibqp_ex)
+{
+	return container_of(ibqp_ex, struct ionic_qp, vqp.qp_ex);
 }
 
 static inline struct ionic_ah *to_ionic_ah(struct ibv_ah *ibah)
