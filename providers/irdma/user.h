@@ -646,6 +646,7 @@ struct irdma_cq_uk {
 	struct irdma_ring cq_ring;
 	__u8 polarity;
 	bool avoid_mem_cflct:1;
+	bool enable_cq_empty_check:1;
 };
 
 struct irdma_qp_uk_init_info {
@@ -685,6 +686,7 @@ struct irdma_cq_uk_init_info {
 	__u32 cq_size;
 	__u32 cq_id;
 	bool avoid_mem_cflct;
+	bool enable_cq_empty_check;
 };
 
 void irdma_print_cqes(struct irdma_cq_uk *cq);

@@ -1597,8 +1597,12 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			if (wqe_idx < qp->conn_wqes && qp->sq_ring.head == qp->sq_ring.tail) {
 				IRDMA_RING_MOVE_HEAD_NOCHECK(cq->cq_ring);
 				IRDMA_RING_MOVE_TAIL(cq->cq_ring);
-				set_64bit_val(cq->shadow_area, 0,
-					      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
+				/* Avoid translation issue by never setting shadow to even value unless the CQ is empty. */
+				if (IRDMA_RING_CURRENT_HEAD(cq->cq_ring) & 1 ||
+				    (cq->enable_cq_empty_check && irdma_uk_cq_empty(cq))) {
+					set_64bit_val(cq->shadow_area, 0,
+						      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
+				}
 				memset(info, 0, sizeof(*info));
 				return irdma_uk_cq_poll_cmpl(cq, info);
 			}
@@ -1698,7 +1702,9 @@ exit:
 		IRDMA_RING_MOVE_TAIL(cq->cq_ring);
 		if (!cq->avoid_mem_cflct && ext_valid)
 			IRDMA_RING_MOVE_TAIL(cq->cq_ring);
-		if (IRDMA_RING_CURRENT_HEAD(cq->cq_ring) & 0x3F || irdma_uk_cq_empty(cq))
+		/* Avoid translation issue by never setting shadow to even value unless the CQ is empty. */
+		if (IRDMA_RING_CURRENT_HEAD(cq->cq_ring) & 1 ||
+		    (cq->enable_cq_empty_check && irdma_uk_cq_empty(cq)))
 			set_64bit_val(cq->shadow_area, 0,
 				      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
 	} else {
@@ -2228,8 +2234,12 @@ int irdma_uk_cq_init(struct irdma_cq_uk *cq, struct irdma_cq_uk_init_info *info)
 	cq->cq_ack_db = info->cq_ack_db;
 	cq->shadow_area = info->shadow_area;
 	cq->avoid_mem_cflct = info->avoid_mem_cflct;
+	cq->enable_cq_empty_check = info->enable_cq_empty_check;
 	IRDMA_RING_INIT(cq->cq_ring, cq->cq_size);
 	cq->polarity = 1;
+
+	__u32 initial_shadow = cq->cq_size - 1;
+	set_64bit_val(cq->shadow_area, 0, initial_shadow);
 
 	return 0;
 }
