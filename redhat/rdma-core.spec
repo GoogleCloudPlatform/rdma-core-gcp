@@ -122,8 +122,16 @@ BuildRequires: pkgconfig(libnl-route-3.0)
 RDMA core development libraries and headers.
 
 %changelog
-* Tue May 9 2023 Leon Romanovsky <leonro@nvidia.com> - 44
-- Fix epoch warning
+* Wed Oct 21 2026 Google LLC <support@google.com> - 61.0-1
+- Initial release for DOCA-OFED coexistence (rdma-core 61.0 /
+  IBVERBS_PABI_VERSION 59, compatible with DOCA 3.3 / MLNX_OFED 2601.x).
+- Replace upstream irdma provider with OOT for optimal support.
+- irdma: Add env param to enable vendor_err passthrough for CIEs.
+- irdma: Add UD queue depth clamping support.
+- irdma: Add env param for overriding user CQ size.
+- irdma: Add support for shared UD credit pool (default 64, 0666 shm perms).
+- redhat: Add standalone ibverbs-providers-irdma-doca package for DOCA-OFED
+  coexistence.
 
 %package -n infiniband-diags
 Summary: InfiniBand Diagnostic Tools
@@ -205,6 +213,16 @@ Device-specific plug-in ibverbs userspace drivers are included:
 - librxe: A software implementation of the RoCE protocol
 - libsiw: A software implementation of the iWarp protocol
 - libvmw_pvrdma: VMware paravirtual RDMA device
+
+%package -n ibverbs-providers-irdma-doca
+Summary: User space irdma provider for DOCA-OFED libibverbs
+Requires: libibverbs%{?_isa} >= 2601
+Requires: libibverbs%{?_isa} < 2604
+
+%description -n ibverbs-providers-irdma-doca
+An RDMA driver consists of a kernel portion and a user space portion.
+This package contains the standalone Intel Ethernet Connection RDMA (irdma)
+user space verbs driver for coexistence with DOCA-OFED (rdma-core v61 ABI).
 
 %package -n libibverbs-utils
 Summary: Examples for the libibverbs library
@@ -604,6 +622,10 @@ fi
 %{_libdir}/libmlx4.so.*
 %config(noreplace) %{_sysconfdir}/libibverbs.d/*.driver
 %doc %{_docdir}/%{name}/libibverbs.md
+
+%files -n ibverbs-providers-irdma-doca
+%config(noreplace) %{_sysconfdir}/libibverbs.d/irdma.driver
+%{_libdir}/libibverbs/libirdma-rdmav*.so
 
 %files -n libibverbs-utils
 %{_bindir}/ibv_*

@@ -101,6 +101,19 @@ Description: User space provider drivers for libibverbs
   - siw: A software implementation of the iWarp protocol
   - vmw_pvrdma: VMware paravirtual RDMA device
 
+Package: ibverbs-providers-irdma-doca
+Architecture: linux-any
+Multi-Arch: same
+Depends: libibverbs1 (>= 2601~),
+         libibverbs1 (<< 2604~),
+         ${misc:Depends},
+         ${shlibs:Depends}
+Breaks: ibverbs-providers (<< 2601~)
+Description: User space irdma provider for DOCA-OFED libibverbs
+ An RDMA driver consists of a kernel portion and a user space portion.
+ This package contains the standalone Intel Ethernet Connection RDMA (irdma)
+ user space verbs driver for coexistence with DOCA-OFED (rdma-core v61 ABI).
+
 Package: ibverbs-utils
 Architecture: linux-any
 Depends: ${misc:Depends}, ${shlibs:Depends}
