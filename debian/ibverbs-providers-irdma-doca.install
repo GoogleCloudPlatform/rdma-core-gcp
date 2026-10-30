@@ -1,0 +1,2 @@
+etc/libibverbs.d/irdma.driver
+usr/lib/*/libibverbs/libirdma-rdmav*.so
