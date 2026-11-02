@@ -119,9 +119,22 @@ struct ex_hdr {
 #define DECLARE_CMD_EX(_enum, _name, _kabi)                                    \
 	DECLARE_CMD_EXX(_enum, _name, _kabi, _kabi##_resp)
 
+#ifdef __cplusplus
+/*
+ * Fix the alignment and size checks so this header file can be compiled as C++.
+ * C++ compilers treat sizeof(empty_struct) == 1 rather than 0.
+ * While special cases to check for std::is_empty may fix alignment checks in
+ * DECLARE_DRV_CMD macros, it is not sufficient for size checks.
+ * Adding a zero-length array inside a struct asks the compiler to treat the
+ * struct as zero length even though std::is_empty is false.
+ */
+struct empty { int dummy[0]; };
+#define _STRUCT_empty struct { int dummy[0]; }
+#else
 /* Drivers may use 'empty' for _kabi to signal no struct */
 struct empty {};
 #define _STRUCT_empty struct {}
+#endif
 
 /*
  * Define the ABI struct for use by the driver. The internal cmd APIs require

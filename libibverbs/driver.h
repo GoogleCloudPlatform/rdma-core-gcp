@@ -36,7 +36,13 @@
 #ifndef INFINIBAND_DRIVER_H
 #define INFINIBAND_DRIVER_H
 
+/* Ensure C and C++ atomic_int implementations remain ABI compatible. */
+#ifdef __cplusplus
+#include <atomic>
+using std::atomic_int;
+#else
 #include <stdatomic.h>
+#endif
 #include <infiniband/verbs.h>
 #include <infiniband/kern-abi.h>
 #include <infiniband/cmd_ioctl.h>
@@ -552,7 +558,9 @@ void *_verbs_init_and_alloc_context(struct ibv_device *device, int cmd_fd,
 				     driver_id)				       \
 	((typeof(drv_ctx_ptr))_verbs_init_and_alloc_context(                   \
 		ibdev, cmd_fd, sizeof(*drv_ctx_ptr),                           \
-		&((typeof(drv_ctx_ptr))NULL)->ctx_memb, (driver_id)))
+		(struct verbs_context *)__builtin_offsetof(                    \
+			typeof(*drv_ctx_ptr), ctx_memb),                       \
+		(driver_id)))
 
 int verbs_init_context(struct verbs_context *context_ex,
 		       struct ibv_device *device, int cmd_fd,

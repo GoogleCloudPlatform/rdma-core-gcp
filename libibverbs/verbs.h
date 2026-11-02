@@ -2665,10 +2665,13 @@ __ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length, unsigned int access,
 					access);
 }
 
+/* Avoid macro-shadowing method names in C++ and Bazel consumers. */
+#if !defined(__cplusplus) && !defined(WITH_BAZEL_BUILD)
 #define ibv_reg_mr(pd, addr, length, access)                                   \
 	__ibv_reg_mr(pd, addr, length, access,                                 \
 		     __builtin_constant_p(				       \
 			     ((int)(access) & IBV_ACCESS_OPTIONAL_RANGE) == 0))
+#endif
 
 /**
  * ibv_reg_mr_iova - Register a memory region with a virtual offset
@@ -2687,10 +2690,13 @@ __ibv_reg_mr_iova(struct ibv_pd *pd, void *addr, size_t length, uint64_t iova,
 		return ibv_reg_mr_iova2(pd, addr, length, iova, access);
 }
 
+/* Avoid macro-shadowing method names in C++ and Bazel consumers. */
+#if !defined(__cplusplus) && !defined(WITH_BAZEL_BUILD)
 #define ibv_reg_mr_iova(pd, addr, length, iova, access)                        \
 	__ibv_reg_mr_iova(pd, addr, length, iova, access,                      \
 			  __builtin_constant_p(                                \
 				  ((access) & IBV_ACCESS_OPTIONAL_RANGE) == 0))
+#endif
 
 /**
  * ibv_reg_dmabuf_mr - Register a dmabuf-based memory region

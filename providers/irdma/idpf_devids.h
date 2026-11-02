@@ -8,6 +8,8 @@
 /* Device IDs common to emr, silicon and simics */
 #define IDPF_DEV_ID_PF			0x1452
 #define IAVF_DEV_ID_VF			0x145C
+#define IDPF_DEV_ID_PF_MMG		0x11DF
+#define IDPF_DEV_ID_VF_MMG		0x0DE2
 #ifdef SIOV_SUPPORT
 #define IAVF_DEV_ID_VF_SIOV		0x0DD5
 #endif /* SIOV_SUPPORT */
