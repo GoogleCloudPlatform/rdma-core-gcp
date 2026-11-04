@@ -50,7 +50,9 @@
 #include <fnmatch.h>
 #include <sys/sysmacros.h>
 
+#ifndef WITH_BAZEL_BUILD
 #include <rdma/rdma_netlink.h>
+#endif
 
 #include <util/util.h>
 #include "driver.h"
@@ -99,8 +101,23 @@ int try_access_device(const struct verbs_sysfs_dev *sysfs_dev)
 	return ret;
 }
 
+#ifdef WITH_BAZEL_BUILD
+/* decl in ibverbs.h */
+int find_sysfs_devs_nl(struct list_head *tmp_sysfs_dev_list) {
+  return -1;
+}
+#endif
+
 enum ibv_node_type decode_knode_type(unsigned int knode_type)
 {
+#ifdef WITH_BAZEL_BUILD
+  /* Avoid rdma_netlink.h dependency in standalone Bazel builds. */
+  if (1 <= knode_type && knode_type <= 7) {
+    return (enum ibv_node_type) knode_type;
+  } else {
+    return IBV_NODE_UNKNOWN;
+  }
+#else
 	switch (knode_type) {
 	case RDMA_NODE_IB_CA:
 		return IBV_NODE_CA;
@@ -118,6 +135,7 @@ enum ibv_node_type decode_knode_type(unsigned int knode_type)
 		return IBV_NODE_UNSPECIFIED;
 	}
 	return IBV_NODE_UNKNOWN;
+#endif
 }
 
 int setup_sysfs_uverbs(int uv_dirfd, const char *uverbs,

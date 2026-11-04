@@ -108,7 +108,12 @@ static const struct verbs_match_ent hca_table[] = {
 	INTEL_HCA(I40E_INTEL_VENDOR_ID, I40E_DEV_ID_X722_VF_HV),
 
 	INTEL_HCA(PCI_VENDOR_ID_INTEL, IDPF_DEV_ID_PF),
+	INTEL_HCA(PCI_VENDOR_ID_INTEL, IAVF_DEV_ID_VF),
 	INTEL_HCA(PCI_VENDOR_ID_INTEL, IAVF_DEV_ID_ADAPTIVE_VF),
+
+	INTEL_HCA(PCI_VENDOR_ID_INTEL, IDPF_DEV_ID_PF_MMG),
+	INTEL_HCA(PCI_VENDOR_ID_INTEL, IDPF_DEV_ID_VF_MMG),
+
 	{}
 };
 
@@ -641,7 +646,8 @@ static struct verbs_device *irdma_device_alloc(struct verbs_sysfs_dev *sysfs_dev
 	return &dev->ibv_dev;
 }
 
-static const struct verbs_device_ops irdma_udev_ops = {
+/* Pin the assembler name so PROVIDER_DRIVER's alias() resolves under -funique-internal-linkage-names. */
+static const struct verbs_device_ops irdma_udev_ops __asm__("irdma_udev_ops") = {
 	.alloc_context = irdma_ualloc_context,
 	.alloc_device = irdma_device_alloc,
 	.match_max_abi_version = IRDMA_MAX_ABI_VERSION,
@@ -652,3 +658,10 @@ static const struct verbs_device_ops irdma_udev_ops = {
 };
 
 PROVIDER_DRIVER(irdma, irdma_udev_ops);
+
+#ifdef WITH_BAZEL_BUILD
+/* Expose driver registration for static C++ constructor initialization. */
+void irdma_driver_registration_module_initializer(void) {
+  verbs_register_driver(&irdma_udev_ops);
+}
+#endif

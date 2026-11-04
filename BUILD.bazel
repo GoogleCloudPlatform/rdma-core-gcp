@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
+# Copyright (C) 2026 Google Corporation
+
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:defs.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+exports_files(["COPYING.BSD_FB", "COPYING.BSD_MIT", "COPYING.md"])
+
+# ==============================================================================
+# Common C/C++ compilation options
+# ==============================================================================
+
+COMMON_COPTS = [
+    "-Wall",
+    "-Wextra",
+    "-Wno-sign-compare",
+    "-Wno-unused-parameter",
+    "-Wno-missing-field-initializers",
+    "-Wno-type-limits",
+    "-Wno-pointer-sign",
+    "-Wno-vla",
+    "-D_GNU_SOURCE",
+    "-DWITH_BAZEL_BUILD",
+    "-DNRESOLVE_NEIGH",
+    "-D_STATIC_LIBRARY_BUILD_",
+]
+
+# ==============================================================================
+# Generated kernel ABI struct headers
+# ==============================================================================
+
+py_binary(
+    name = "make_abi_structs",
+    srcs = ["buildlib/make_abi_structs.py"],
+    legacy_create_init = 0,
+    main = "buildlib/make_abi_structs.py",
+)
+
+STANDARD_KERNEL_HEADERS = [
+    "irdma-abi.h",
+    "ib_user_verbs.h",
+]
+
+[
+    genrule(
+        name = hdr.removesuffix(".h").replace("-", "_") + "_rule",
+        srcs = ["kernel-headers/rdma/" + hdr],
+        outs = ["kernel-headers/kernel-abi/" + hdr],
+        cmd = "$(execpath :make_abi_structs) \"$<\" \"$@\"",
+        tools = [":make_abi_structs"],
+    )
+    for hdr in STANDARD_KERNEL_HEADERS
+]
+
+# ==============================================================================
+# Build configuration and in-tree CCAN
+# ==============================================================================
+
+cc_library(
+    name = "build_config",
+    hdrs = [
+        "bazel_build/build_headers/config.h",
+        "bazel_build/build_headers/valgrind/memcheck.h",
+    ],
+    includes = [
+        "bazel_build/build_headers",
+    ],
+)
+
+cc_library(
+    name = "ccan",
+    srcs = [
+        "ccan/ilog.c",
+        "ccan/list.c",
+        "ccan/str.c",
+    ],
+    hdrs = glob(["ccan/*.h"]),
+    copts = COMMON_COPTS,
+    includes = ["."],
+    deps = [":build_config"],
+)
+
+# ==============================================================================
+# Kernel headers
+# ==============================================================================
+
+cc_library(
+    name = "kernel_headers",
+    hdrs = glob(
+        ["kernel-headers/rdma/*.h"],
+        exclude = ["kernel-headers/rdma/rdma_netlink.h"],
+    ) + [
+        "kernel-headers/kernel-abi/" + hdr for hdr in STANDARD_KERNEL_HEADERS
+    ],
+    include_prefix = "third_party/rdma_core",
+    includes = [
+        "kernel-headers",
+    ],
+)
+
+cc_library(
+    name = "kernel_headers_rdma",
+    hdrs = glob(
+        ["kernel-headers/rdma/*.h"],
+        exclude = ["kernel-headers/rdma/rdma_netlink.h"],
+    ),
+    include_prefix = "rdma",
+    strip_include_prefix = "kernel-headers/rdma",
+)
+
+cc_library(
+    name = "kernel_headers_infiniband",
+    hdrs = [
+        "kernel-headers/rdma/ib_user_ioctl_verbs.h",
+        "kernel-headers/rdma/irdma-abi.h",
+    ],
+    include_prefix = "infiniband",
+    strip_include_prefix = "kernel-headers/rdma",
+)
+
+# ==============================================================================
+# Utility library
+# ==============================================================================
+
+cc_library(
+    name = "util",
+    srcs = glob(
+        ["util/*.c"],
+        exclude = [
+            "util/node_name_map.c",
+            "util/rdma_nl.c",
+        ],
+    ),
+    hdrs = glob(
+        ["util/*.h"],
+        exclude = ["util/rdma_nl.h"],
+    ),
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = ["."],
+    deps = [
+        ":build_config",
+        ":ccan",
+        ":kernel_headers",
+        ":kernel_headers_infiniband",
+        ":kernel_headers_rdma",
+    ],
+)
+
+# ==============================================================================
+# Header libraries for libibverbs and providers
+# ==============================================================================
+
+cc_library(
+    name = "infiniband_headers",
+    hdrs = glob(
+        ["libibverbs/*.h"],
+        exclude = ["libibverbs/neigh.h"],
+    ),
+    include_prefix = "infiniband",
+    strip_include_prefix = "libibverbs",
+    deps = [
+        ":build_config",
+        ":ccan",
+        ":kernel_headers_infiniband",
+    ],
+)
+
+cc_library(
+    name = "libibverbs_headers",
+    hdrs = glob(
+        ["libibverbs/*.h"],
+        exclude = ["libibverbs/neigh.h"],
+    ),
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = [
+        ".",
+        "libibverbs",
+    ],
+    deps = [
+        ":build_config",
+        ":ccan",
+        ":infiniband_headers",
+        ":kernel_headers",
+        ":kernel_headers_infiniband",
+        ":kernel_headers_rdma",
+        ":util",
+    ],
+)
+
+# ==============================================================================
+# libibverbs core library
+# ==============================================================================
+
+cc_library(
+    name = "libibverbs",
+    srcs = glob(
+        ["libibverbs/*.c"],
+        exclude = [
+            "libibverbs/all_providers.c",
+            "libibverbs/dynamic_driver.c",
+            "libibverbs/ibdev_nl.c",
+            "libibverbs/neigh.c",
+            "libibverbs/static_driver.c",
+        ],
+    ),
+    hdrs = glob(
+        ["libibverbs/*.h"],
+        exclude = ["libibverbs/neigh.h"],
+    ),
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = [
+        ".",
+        "libibverbs",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ldl",
+    ],
+    deps = [
+        ":build_config",
+        ":ccan",
+        ":infiniband_headers",
+        ":kernel_headers",
+        ":kernel_headers_infiniband",
+        ":kernel_headers_rdma",
+        ":util",
+    ],
+)
+
+# ==============================================================================
+# Providers (irdma)
+# ==============================================================================
+
+cc_library(
+    name = "irdma",
+    srcs = glob(["providers/irdma/*.c"]),
+    hdrs = glob(["providers/irdma/*.h"]),
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = ["."],
+    deps = [
+        ":build_config",
+        ":ccan",
+        ":infiniband_headers",
+        ":kernel_headers",
+        ":kernel_headers_infiniband",
+        ":kernel_headers_rdma",
+        ":libibverbs",
+        ":libibverbs_headers",
+        ":util",
+    ],
+)
+
+# ==============================================================================
+# Provider initialization
+# ==============================================================================
+
+cc_library(
+    name = "init",
+    srcs = ["bazel_build/init/init.c"],
+    hdrs = ["bazel_build/init/init.h"],
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = ["."],
+    deps = [
+        ":irdma",
+    ],
+)
+
+cc_library(
+    name = "irdma_init",
+    srcs = ["bazel_build/init/irdma_init.cc"],
+    copts = COMMON_COPTS,
+    include_prefix = "third_party/rdma_core",
+    includes = ["."],
+    alwayslink = 1,
+    deps = [
+        ":init",
+    ],
+)

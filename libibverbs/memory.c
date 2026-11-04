@@ -45,7 +45,11 @@
 #include <inttypes.h>
 
 #include "ibverbs.h"
+#ifdef WITH_BAZEL_BUILD
+bool get_copy_on_fork(void) { return false; }
+#else
 #include "util/rdma_nl.h"
+#endif
 
 struct ibv_mem_node {
 	enum {
@@ -58,11 +62,19 @@ struct ibv_mem_node {
 	int			refcnt;
 };
 
+#ifdef WITH_BAZEL_BUILD
+static struct ibv_mem_node * _Atomic mm_root;
+#else
 static struct ibv_mem_node *mm_root;
+#endif
 static pthread_mutex_t mm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int page_size;
 static int huge_page_enabled;
+#ifdef WITH_BAZEL_BUILD
+static atomic_int too_late;
+#else
 static int too_late;
+#endif
 
 static unsigned long smaps_page_size(FILE *file)
 {

@@ -78,7 +78,8 @@ static inline unsigned long align_down(unsigned long val, unsigned long _align)
 
 static inline uint64_t roundup_pow_of_two(uint64_t n)
 {
-	return n == 1 ? 1 : 1ULL << ilog64(n - 1);
+	/* Guard n == 0 to avoid undefined shift by 64 from ilog64(UINT64_MAX). */
+	return n <= 1 ? 1 : 1ULL << ilog64(n - 1);
 }
 
 static inline uint64_t rounddown_pow_of_two(uint64_t n)

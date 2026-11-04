@@ -479,6 +479,35 @@ static void irdma_free_hw_buf(void *buf, size_t size)
 	free(buf);
 }
 
+/* Allocate a ring buffer via mmap. */
+static void *irdma_mmap_hw_buf(size_t size)
+{
+	void *buf;
+
+	buf = mmap(NULL, size,
+		   PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (buf == MAP_FAILED) {
+		fprintf(stderr, PFX "%s: Failed to mmap memory of size %zu\n",
+			__func__, size);
+		return NULL;
+	}
+
+	/*
+	 * Force 4 KiB base pages and do not fault the mapping in userspace. Let
+	 * it get faulted during the ibv_cmd_reg_mr so that it's not allocated
+	 * as __GFP_MOVABLE. Best effort.
+	 */
+	madvise(buf, size, MADV_NOHUGEPAGE);
+	if (ibv_dontfork_range(buf, size)) {
+		fprintf(stderr, PFX "%s: ibv_dontfork_range failed, size %zu\n",
+			__func__, size);
+		munmap(buf, size);
+		return NULL;
+	}
+
+	return buf;
+}
+
 static void irdma_get_alloc_type(enum irdma_resource_type resc_type, struct ibv_pd *pd,
 				 enum irdma_alloc_type *type, enum irdma_alloc_type default_type)
 {
@@ -554,6 +583,9 @@ static void *irdma_alloc_buf_sz(enum irdma_resource_type resc_type, struct ibv_p
 	case IRDMA_ALLOC_TYPE_KMEM:
 		buf = irdma_alloc_buf_kmem(fd, size);
 		break;
+	case IRDMA_ALLOC_TYPE_MMAP:
+		buf = irdma_mmap_hw_buf(size);
+		break;
 	case IRDMA_ALLOC_TYPE_DEFAULT:
 	default:
 		buf = irdma_calloc_hw_buf_sz(size, alignment);
@@ -574,6 +606,7 @@ static void irdma_free_buf(void *buf, size_t size, enum irdma_alloc_type alloc_t
 {
 	switch (alloc_type) {
 	case IRDMA_ALLOC_TYPE_KMEM:
+	case IRDMA_ALLOC_TYPE_MMAP:
 		irdma_free_buf_kmem(buf, size);
 		break;
 	case IRDMA_ALLOC_TYPE_DEFAULT:
@@ -581,6 +614,49 @@ static void irdma_free_buf(void *buf, size_t size, enum irdma_alloc_type alloc_t
 		irdma_free_hw_buf(buf, size);
 		break;
 	}
+}
+
+/* Register a QP/CQ/SRQ buffer. If it fails, retry with an mmap-ed buffer. */
+static int irdma_reg_hw_buf(struct ibv_pd *pd, void **buf, size_t size,
+			    enum irdma_alloc_type *alloc_type,
+			    struct verbs_mr *vmr, struct irdma_ureg_mr *cmd)
+{
+	struct ib_uverbs_reg_mr_resp resp = {};
+	void *mmap_buf;
+	int ret;
+
+	ret = ibv_cmd_reg_mr(pd, *buf, size, (uintptr_t)*buf,
+			     IBV_ACCESS_LOCAL_WRITE, vmr, &cmd->ibv_cmd,
+			     sizeof(*cmd), &resp, sizeof(resp));
+
+	/* If default allocation was registered, then bail now. Otherwise, retry
+	 * with an mmap allocation+registration.
+	 */
+	if (!ret || *alloc_type != IRDMA_ALLOC_TYPE_DEFAULT)
+		return ret;
+
+	fprintf(stderr,
+		PFX "%s: ibv_cmd_reg_mr failed (ret=%d) for size %zu, falling back to mmap\n",
+		__func__, ret, size);
+
+	mmap_buf = irdma_mmap_hw_buf(size);
+	if (!mmap_buf)
+		return ret;
+
+	memset(&resp, 0, sizeof(resp));
+	ret = ibv_cmd_reg_mr(pd, mmap_buf, size, (uintptr_t)mmap_buf,
+			     IBV_ACCESS_LOCAL_WRITE, vmr, &cmd->ibv_cmd,
+			     sizeof(*cmd), &resp, sizeof(resp));
+	if (ret) {
+		irdma_free_buf(mmap_buf, size, IRDMA_ALLOC_TYPE_MMAP);
+		return ret;
+	}
+
+	/* Free the original buffer. */
+	irdma_free_buf(*buf, size, *alloc_type);
+	*buf = mmap_buf;
+	*alloc_type = IRDMA_ALLOC_TYPE_MMAP;
+	return 0;
 }
 
 /**
@@ -647,7 +723,6 @@ err:
 struct ibv_srq *irdma_ucreate_srq(struct ibv_pd *pd,
 				  struct ibv_srq_init_attr *initattr)
 {
-	struct ib_uverbs_reg_mr_resp reg_mr_resp = {};
 	struct irdma_srq_uk_init_info info = {};
 	struct irdma_ucreate_srq_resp resp = {};
 	struct irdma_ureg_mr reg_mr_cmd = {};
@@ -666,6 +741,11 @@ struct ibv_srq *irdma_ucreate_srq(struct ibv_pd *pd,
 	iwvctx = container_of(pd->context, struct irdma_uvcontext, ibv_ctx.context);
 	uk_attrs = &iwvctx->uk_attrs;
 	attr = &initattr->attr;
+
+	if (!(uk_attrs->feature_flags & IRDMA_FEATURE_SRQ)) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
 
 	if (attr->max_sge > uk_attrs->max_hw_wq_frags ||
 	    attr->max_wr > uk_attrs->max_hw_srq_quanta) {
@@ -704,18 +784,15 @@ struct ibv_srq *irdma_ucreate_srq(struct ibv_pd *pd,
 		ret = ENOMEM;
 		goto err_sges;
 	}
-	iwusrq->alloc_type = alloc_type;
 
 	reg_mr_cmd.reg_type = IRDMA_MEMREG_TYPE_SRQ;
 	reg_mr_cmd.rq_pages = size >> IRDMA_HW_PAGE_SHIFT;
 
-	ret = ibv_cmd_reg_mr(pd, info.srq, total_size,
-			     (uintptr_t)info.srq, IBV_ACCESS_LOCAL_WRITE,
-			     &iwusrq->vmr, &reg_mr_cmd.ibv_cmd,
-			     sizeof(reg_mr_cmd), &reg_mr_resp,
-			     sizeof(reg_mr_resp));
+	ret = irdma_reg_hw_buf(pd, (void **)&info.srq, total_size, &alloc_type,
+			       &iwusrq->vmr, &reg_mr_cmd);
 	if (ret)
 		goto err_cmd_reg;
+	iwusrq->alloc_type = alloc_type;
 
 	iwusrq->vmr.ibv_mr.pd = pd;
 	info.shadow_area = (__le64 *)((__u8 *)info.srq + size);
@@ -807,9 +884,7 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 	struct irdma_ureg_mr reg_mr_cmd = {};
 	struct irdma_ucreate_cq_ex cmd = {};
 	struct irdma_ucreate_cq_ex_resp resp = {};
-	struct ib_uverbs_reg_mr_resp reg_mr_resp = {};
 	struct irdma_ureg_mr reg_mr_shadow_cmd = {};
-	struct ib_uverbs_reg_mr_resp reg_mr_shadow_resp = {};
 	struct irdma_uk_attrs *uk_attrs;
 	struct irdma_uvcontext *iwvctx;
 	struct irdma_ucq *iwucq;
@@ -887,25 +962,27 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 		ret = ENOMEM;
 		goto err_cq_base;
 	}
-	iwucq->alloc_type = alloc_type;
 
 	reg_mr_cmd.reg_type = IRDMA_MEMREG_TYPE_CQ;
 	reg_mr_cmd.cq_pages = cq_pages;
 
-	ret = ibv_cmd_reg_mr(&iwvctx->iwupd->ibv_pd, info.cq_base,
-			     total_size, (uintptr_t)info.cq_base,
-			     IBV_ACCESS_LOCAL_WRITE, &iwucq->vmr,
-			     &reg_mr_cmd.ibv_cmd, sizeof(reg_mr_cmd),
-			     &reg_mr_resp, sizeof(reg_mr_resp));
-	if (ret)
+	ret = irdma_reg_hw_buf(&iwvctx->iwupd->ibv_pd, (void **)&info.cq_base,
+			       total_size, &alloc_type, &iwucq->vmr,
+			       &reg_mr_cmd);
+	if (ret) {
+		fprintf(stderr, PFX "%s: Failed to register CQ region ret=%d\n", __func__,
+						ret);
 		goto err_dereg_mr;
+	}
+	iwucq->alloc_type = alloc_type;
 
 	iwucq->vmr.ibv_mr.pd = &iwvctx->iwupd->ibv_pd;
 
 	if (uk_attrs->feature_flags & IRDMA_FEATURE_CQ_RESIZE) {
 		info.shadow_area = irdma_alloc_buf(IRDMA_RESOURCE_TYPE_CQ, pd,
 						   IRDMA_DB_SHADOW_AREA_SIZE,
-						   context->cmd_fd, NULL);
+						   context->cmd_fd,
+						   &iwucq->shadow_alloc_type);
 		if (!info.shadow_area) {
 			ret = ENOMEM;
 			goto err_alloc_shadow;
@@ -915,13 +992,17 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 		reg_mr_shadow_cmd.reg_type = IRDMA_MEMREG_TYPE_CQ;
 		reg_mr_shadow_cmd.cq_pages = 1;
 
-		ret = ibv_cmd_reg_mr(&iwvctx->iwupd->ibv_pd, info.shadow_area,
-				     IRDMA_DB_SHADOW_AREA_SIZE, (uintptr_t)info.shadow_area,
-				     IBV_ACCESS_LOCAL_WRITE, &iwucq->vmr_shadow_area,
-				     &reg_mr_shadow_cmd.ibv_cmd, sizeof(reg_mr_shadow_cmd),
-				     &reg_mr_shadow_resp, sizeof(reg_mr_shadow_resp));
+		ret = irdma_reg_hw_buf(&iwvctx->iwupd->ibv_pd,
+				       (void **)&info.shadow_area,
+				       IRDMA_DB_SHADOW_AREA_SIZE,
+				       &iwucq->shadow_alloc_type,
+				       &iwucq->vmr_shadow_area,
+				       &reg_mr_shadow_cmd);
 		if (ret) {
-			irdma_free_buf(info.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE, alloc_type);
+			fprintf(stderr, PFX "%s: Failed to register CQ shadow region ret=%d\n",
+						__func__, ret);
+			irdma_free_buf(info.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE,
+				       iwucq->shadow_alloc_type);
 			goto err_alloc_shadow;
 		}
 
@@ -962,7 +1043,8 @@ static struct ibv_cq_ex *ucreate_cq(struct ibv_context *context,
 err_create_cq:
 	if (iwucq->vmr_shadow_area.ibv_mr.handle) {
 		ibv_cmd_dereg_mr(&iwucq->vmr_shadow_area);
-		irdma_free_buf(info.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE, alloc_type);
+		irdma_free_buf(info.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE,
+			       iwucq->shadow_alloc_type);
 	}
 err_alloc_shadow:
 	ibv_cmd_dereg_mr(&iwucq->vmr);
@@ -1062,7 +1144,8 @@ int irdma_udestroy_cq(struct ibv_cq *cq)
 
 	if (uk_attrs->feature_flags & IRDMA_FEATURE_CQ_RESIZE) {
 		ibv_cmd_dereg_mr(&iwucq->vmr_shadow_area);
-		irdma_free_buf(iwucq->cq.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE, iwucq->alloc_type);
+		irdma_free_buf(iwucq->cq.shadow_area, IRDMA_DB_SHADOW_AREA_SIZE,
+			       iwucq->shadow_alloc_type);
 	}
 
 	irdma_process_resize_list(iwucq, NULL);
@@ -1809,7 +1892,6 @@ static int irdma_vmapped_qp(struct irdma_uqp *iwuqp, struct ibv_pd *pd,
 	size_t sqsize, rqsize, totalqpsize;
 	struct irdma_ucreate_qp_resp resp = {};
 	struct irdma_ureg_mr reg_mr_cmd = {};
-	struct ib_uverbs_reg_mr_resp reg_mr_resp = {};
 	struct irdma_uvcontext *iwvctx;
 	int ret;
 	long os_pgsz = IRDMA_HW_PAGE_SIZE;
@@ -1834,22 +1916,22 @@ static int irdma_vmapped_qp(struct irdma_uqp *iwuqp, struct ibv_pd *pd,
 	if (!info->sq)
 		return ENOMEM;
 
-	iwuqp->alloc_type = alloc_type;
-	iwuqp->buf_size = totalqpsize;
-	info->rq = &info->sq[sqsize / IRDMA_QP_WQE_MIN_SIZE];
-	info->shadow_area = info->rq[rqsize / IRDMA_QP_WQE_MIN_SIZE].elem;
-
 	reg_mr_cmd.reg_type = IRDMA_MEMREG_TYPE_QP;
 	reg_mr_cmd.sq_pages = sqsize >> IRDMA_HW_PAGE_SHIFT;
 	reg_mr_cmd.rq_pages = rqsize >> IRDMA_HW_PAGE_SHIFT;
 
-	ret = ibv_cmd_reg_mr(pd, info->sq, totalqpsize,
-			     (uintptr_t)info->sq, IBV_ACCESS_LOCAL_WRITE,
-			     &iwuqp->vmr, &reg_mr_cmd.ibv_cmd,
-			     sizeof(reg_mr_cmd), &reg_mr_resp,
-			     sizeof(reg_mr_resp));
-	if (ret)
+	ret = irdma_reg_hw_buf(pd, (void **)&info->sq, totalqpsize, &alloc_type,
+			       &iwuqp->vmr, &reg_mr_cmd);
+	if (ret) {
+		fprintf(stderr, PFX "%s: Failed to register QP region, ret=%d\n",
+						__func__, ret);
 		goto err_dereg_mr;
+	}
+
+	iwuqp->alloc_type = alloc_type;
+	iwuqp->buf_size = totalqpsize;
+	info->rq = &info->sq[sqsize / IRDMA_QP_WQE_MIN_SIZE];
+	info->shadow_area = info->rq[rqsize / IRDMA_QP_WQE_MIN_SIZE].elem;
 
 	cmd.user_wqe_bufs = (__u64)((uintptr_t)info->sq);
 	cmd.user_compl_ctx = (__u64)(uintptr_t)&iwuqp->qp;
@@ -1858,8 +1940,11 @@ static int irdma_vmapped_qp(struct irdma_uqp *iwuqp, struct ibv_pd *pd,
 	ret = ibv_cmd_create_qp(pd, &iwuqp->ibv_qp, attr, &cmd.ibv_cmd,
 				sizeof(cmd), &resp.ibv_resp,
 				sizeof(struct irdma_ucreate_qp_resp));
-	if (ret)
+	if (ret) {
+		fprintf(stderr, PFX "%s: Failed driver call to create QP, ret=%d\n",
+						__func__, ret);
 		goto err_qp;
+	}
 
 	info->sq_size = resp.actual_sq_size;
 	info->rq_size = resp.actual_rq_size;
@@ -1871,19 +1956,15 @@ static int irdma_vmapped_qp(struct irdma_uqp *iwuqp, struct ibv_pd *pd,
 	iwuqp->irdma_drv_opt = resp.irdma_drv_opt;
 	iwuqp->ibv_qp.qp_num = resp.qp_id;
 
-	iwuqp->send_cq = container_of(attr->send_cq, struct irdma_ucq,
-				      verbs_cq.cq);
-	iwuqp->recv_cq = container_of(attr->recv_cq, struct irdma_ucq,
-				      verbs_cq.cq);
-	iwuqp->send_cq->uqp = iwuqp;
-	iwuqp->recv_cq->uqp = iwuqp;
+	iwuqp->send_cq = container_of(attr->send_cq, struct irdma_ucq, verbs_cq.cq);
+	iwuqp->recv_cq = container_of(attr->recv_cq, struct irdma_ucq, verbs_cq.cq);
 
 	return 0;
 err_qp:
 	ibv_cmd_dereg_mr(&iwuqp->vmr);
 err_dereg_mr:
 	fprintf(stderr, PFX "%s: failed to create QP, status %d\n", __func__, ret);
-	irdma_free_buf(info->sq, iwuqp->buf_size, alloc_type);
+	irdma_free_buf(info->sq, totalqpsize, alloc_type);
 	return ret;
 }
 
@@ -2803,11 +2884,11 @@ int irdma_uresize_cq(struct ibv_cq *cq, int cqe)
 	struct irdma_uresize_cq cmd = {};
 	struct ib_uverbs_resize_cq_resp resp = {};
 	struct irdma_ureg_mr reg_mr_cmd = {};
-	struct ib_uverbs_reg_mr_resp reg_mr_resp = {};
 	struct irdma_cq_buf *cq_buf = NULL;
 	struct irdma_cqe *cq_base = NULL;
 	struct verbs_mr new_mr = {};
 	struct irdma_ucq *iwucq;
+	enum irdma_alloc_type alloc_type;
 	bool cqe_64byte_ena;
 	size_t cq_size;
 	__u32 cq_pages;
@@ -2835,7 +2916,8 @@ int irdma_uresize_cq(struct ibv_cq *cq, int cqe)
 
 	cq_size = get_cq_total_bytes(cqe_needed, cqe_64byte_ena);
 	cq_pages = cq_size >> IRDMA_HW_PAGE_SHIFT;
-	cq_base = irdma_alloc_buf(IRDMA_RESOURCE_TYPE_CQ, pd, cq_size, cq->context->cmd_fd, NULL);
+	cq_base = irdma_alloc_buf(IRDMA_RESOURCE_TYPE_CQ, pd, cq_size,
+				  cq->context->cmd_fd, &alloc_type);
 	if (!cq_base)
 		return ENOMEM;
 
@@ -2849,10 +2931,8 @@ int irdma_uresize_cq(struct ibv_cq *cq, int cqe)
 	reg_mr_cmd.reg_type = IRDMA_MEMREG_TYPE_CQ;
 	reg_mr_cmd.cq_pages = cq_pages;
 
-	ret = ibv_cmd_reg_mr(new_mr.ibv_mr.pd, cq_base, cq_size,
-			     (uintptr_t)cq_base, IBV_ACCESS_LOCAL_WRITE,
-			     &new_mr, &reg_mr_cmd.ibv_cmd, sizeof(reg_mr_cmd),
-			     &reg_mr_resp, sizeof(reg_mr_resp));
+	ret = irdma_reg_hw_buf(new_mr.ibv_mr.pd, (void **)&cq_base, cq_size,
+			       &alloc_type, &new_mr, &reg_mr_cmd);
 	if (ret)
 		goto err_dereg_mr;
 
@@ -2870,6 +2950,7 @@ int irdma_uresize_cq(struct ibv_cq *cq, int cqe)
 	cq_buf->buf_size = iwucq->buf_size;
 	iwucq->buf_size = cq_size;
 	cq_buf->alloc_type = iwucq->alloc_type;
+	iwucq->alloc_type = alloc_type;
 	cq_buf->vmr = iwucq->vmr;
 	iwucq->vmr = new_mr;
 	irdma_uk_cq_resize(&iwucq->cq, cq_base, cqe_needed);
@@ -2888,7 +2969,7 @@ err_dereg_mr:
 	free(cq_buf);
 err_buf:
 	fprintf(stderr, "failed to resize CQ cq_id=%d ret=%d\n", iwucq->cq.cq_id, ret);
-	irdma_free_buf(cq_base, cq_size, iwucq->alloc_type);
+	irdma_free_buf(cq_base, cq_size, alloc_type);
 	return ret;
 }
 

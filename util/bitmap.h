@@ -97,7 +97,11 @@ static inline unsigned long *bitmap_alloc0(unsigned long size)
 {
 	unsigned long *bmp;
 
+#ifdef __cplusplus
+	bmp = static_cast<unsigned long *>(calloc(BITS_TO_LONGS(size), sizeof(long)));
+#else
 	bmp = calloc(BITS_TO_LONGS(size), sizeof(long));
+#endif
 	if (!bmp)
 		return NULL;
 

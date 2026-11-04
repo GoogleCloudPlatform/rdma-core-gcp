@@ -52,7 +52,9 @@
 #include "ibverbs.h"
 #include <net/if.h>
 #include <net/if_arp.h>
+#ifndef WITH_BAZEL_BUILD
 #include "neigh.h"
+#endif
 
 #undef ibv_query_port
 
@@ -1204,6 +1206,8 @@ static inline int create_peer_from_gid(int family, void *raw_gid,
 	return 0;
 }
 
+#ifndef WITH_BAZEL_BUILD
+
 #define NEIGH_GET_DEFAULT_TIMEOUT_MS 3000
 int ibv_resolve_eth_l2_from_gid(struct ibv_context *context,
 				struct ibv_ah_attr *attr,
@@ -1288,6 +1292,16 @@ free_resources:
 
 	return ret;
 }
+#else
+int ibv_resolve_eth_l2_from_gid(struct ibv_context *context,
+				struct ibv_ah_attr *attr,
+				uint8_t eth_mac[ETHERNET_LL_SIZE],
+				uint16_t *vid)
+{
+  errno = EOPNOTSUPP;
+  return -1;
+}
+#endif
 
 int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
 {

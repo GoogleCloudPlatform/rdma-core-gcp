@@ -42,6 +42,7 @@ enum irdma_supported_wc_flags_ex {
 enum irdma_alloc_type {
 	IRDMA_ALLOC_TYPE_DEFAULT,
 	IRDMA_ALLOC_TYPE_KMEM,
+	IRDMA_ALLOC_TYPE_MMAP,
 	IRDMA_ALLOC_TYPE_LAST,
 };
 
@@ -129,12 +130,12 @@ struct irdma_ucq {
 	struct irdma_spinlock lock;
 	size_t buf_size;
 	enum irdma_alloc_type alloc_type;
+	enum irdma_alloc_type shadow_alloc_type;
 	bool is_armed;
 	bool skip_arm;
 	bool arm_sol;
 	bool skip_sol;
 	int comp_vector;
-	struct irdma_uqp *uqp;
 	struct irdma_cq_uk cq;
 	struct list_head resize_list;
 	/* for extended CQ completion fields */
