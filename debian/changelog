@@ -1,3 +1,10 @@
+rdma-core (61.1-1) unstable; urgency=medium
+
+  * verbs: Backport ibv_query_port_speed() ABI to match DOCA 3.3 (2601.x)
+    libibverbs struct verbs_context_ops layout.
+
+ -- Google LLC <support@google.com>  Fri, 30 Oct 2026 02:01:12 +0000
+
 rdma-core (61.0-1) unstable; urgency=medium
 
   * Initial release for DOCA-OFED coexistence (rdma-core 61.0 /

@@ -1,5 +1,5 @@
 Name: rdma-core
-Version: 61.0
+Version: 61.1
 Release: 1%{?dist}
 Summary: RDMA core userspace libraries and daemons
 
@@ -122,6 +122,10 @@ BuildRequires: pkgconfig(libnl-route-3.0)
 RDMA core development libraries and headers.
 
 %changelog
+* Fri Oct 30 2026 Google LLC <support@google.com> - 61.1-1
+- verbs: Backport ibv_query_port_speed() ABI to match DOCA 3.3 (2601.x)
+  libibverbs struct verbs_context_ops layout.
+
 * Wed Oct 21 2026 Google LLC <support@google.com> - 61.0-1
 - Initial release for DOCA-OFED coexistence (rdma-core 61.0 /
   IBVERBS_PABI_VERSION 59, compatible with DOCA 3.3 / MLNX_OFED 2601.x).
