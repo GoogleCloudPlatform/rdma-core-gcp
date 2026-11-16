@@ -4,6 +4,7 @@
 /files
 /ibacm/
 /ibverbs-providers/
+/ibverbs-providers-irdma-doca/
 /ibverbs-utils/
 /infiniband-diags/
 /lib*/
